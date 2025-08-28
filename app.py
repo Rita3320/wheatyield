@@ -5,7 +5,8 @@ import tempfile
 import streamlit as st
 import pandas as pd
 import numpy as np
-from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor, Pool
 
 
 # ================= Page =================
@@ -34,7 +35,7 @@ if os.path.exists(DEFAULT_MODEL):
         st.error(f"Failed to load model from '{DEFAULT_MODEL}': {e}")
         st.stop()
 else:
-    st.error(f"Model file not found: '{DEFAULT_MODEL}'. Please place the CatBoost .cbm file at this path.")
+    st.error(f"Model file not found: '{DEFAULT_MODEL}'. Place the CatBoost .cbm file at this path.")
     st.stop()
 
 # load features
@@ -43,12 +44,12 @@ if os.path.exists(DEFAULT_FEATS):
         with open(DEFAULT_FEATS, "r", encoding="utf-8") as f:
             top_features = json.load(f)
         if not isinstance(top_features, list) or not all(isinstance(x, str) for x in top_features):
-            raise ValueError("top_features.json must contain a JSON array of strings.")
+            raise ValueError("top_features.json must be a JSON array of strings.")
     except Exception as e:
         st.error(f"Failed to load feature list from '{DEFAULT_FEATS}': {e}")
         st.stop()
 else:
-    st.error(f"Feature list file not found: '{DEFAULT_FEATS}'. Please place the JSON file at this path.")
+    st.error(f"Feature list file not found: '{DEFAULT_FEATS}'. Place the JSON file at this path.")
     st.stop()
 
 
@@ -84,9 +85,28 @@ def group_features(feats: list[str]) -> dict[str, list[str]]:
 def predict_with_model(model: CatBoostRegressor, df: pd.DataFrame, feats: list[str]) -> np.ndarray:
     return model.predict(df[feats])
 
+def validate_inputs(row: pd.Series) -> list[str]:
+    """Simple sanity checks; add/adjust as you like."""
+    warnings = []
+    for k, v in row.items():
+        if pd.isna(v):
+            continue
+        lk = k.lower()
+        if "tmean" in lk and not (-30.0 <= v <= 45.0):
+            warnings.append(f"{k} out of range (-30~45 °C): {v}")
+        if "precip" in lk and not (0.0 <= v <= 500.0):
+            warnings.append(f"{k} out of range (0~500 mm): {v}")
+        if ("sun" in lk or "rad" in lk) and not (0.0 <= v <= 400.0):
+            warnings.append(f"{k} out of range (0~400 hr): {v}")
+        if ("wind" in lk or "ws" in lk) and not (0.0 <= v <= 30.0):
+            warnings.append(f"{k} out of range (0~30 m/s): {v}")
+        if "dryness" in lk and not (0.0 <= v <= 2.0):
+            warnings.append(f"{k} out of range (0~2 ratio): {v}")
+    return warnings
+
 
 # ================= Display candidates for manual UI =================
-# Ensure precipitation / wind / sunshine inputs show up even if not in top_features
+# ensure precipitation / wind / sunshine inputs appear even if not in top_features
 DISPLAY_CANDIDATES = [
     "sowingTmeanAvg","sowingPrecipSum","sowingSunHours","sowingWindAvg",
     "overwinterTmeanAvg","overwinterPrecipSum","overwinterSunHours","overwinterWindAvg",
@@ -97,12 +117,12 @@ DISPLAY_CANDIDATES = [
     "gddBase5","hddGt30","cddLt0",
 ]
 
-
-# ================= Main =================
 # union for UI display (keep order and unique)
 display_features = list(dict.fromkeys(DISPLAY_CANDIDATES + top_features))
 
-tab_batch, tab_manual = st.tabs(["Batch Prediction", "Manual Weather Input"])
+
+# ================= Tabs =================
+tab_batch, tab_manual, tab_insight = st.tabs(["Batch Prediction", "Manual Weather Input", "Insights & Scenarios"])
 
 # ----- Batch -----
 with tab_batch:
@@ -122,7 +142,6 @@ with tab_batch:
         else:
             with st.spinner("Running prediction..."):
                 pred_df = df.copy()
-                # row-wise median fill for model features
                 row_medians = pred_df[top_features].median(axis=1)
                 pred_df[top_features] = pred_df[top_features].T.fillna(row_medians).T
                 preds = predict_with_model(model, pred_df, top_features)
@@ -212,14 +231,103 @@ with tab_manual:
 
     # Build input strictly with model features
     input_df = pd.DataFrame([{k: user_input.get(k, None) for k in top_features}], columns=top_features)
+
+    # Input validation (before fill)
+    warnings = validate_inputs(input_df.iloc[0])
+    if warnings:
+        st.warning("Input warnings:\n- " + "\n- ".join(warnings))
+
     # row-wise median fill
     row_median = input_df.iloc[0].dropna().median()
-    input_df = input_df.fillna(row_median)
+    input_df_filled = input_df.fillna(row_median)
 
     st.markdown("Final Input Used For Prediction (after filling missing values):")
-    st.dataframe(input_df)
+    st.dataframe(input_df_filled)
 
     if st.button("Predict Yield"):
         with st.spinner("Running prediction..."):
-            yhat = predict_with_model(model, input_df, top_features)[0]
+            yhat = predict_with_model(model, input_df_filled, top_features)[0]
         st.success(f"Predicted Yield per Hectare: {yhat:.2f} tons")
+        st.session_state["last_prediction"] = float(yhat)
+        st.session_state["last_input_row"] = input_df_filled.iloc[0].to_dict()
+
+# ----- Insights & Scenarios -----
+with tab_insight:
+    st.subheader("Insights and Scenarios")
+
+    # 1) Save / Load current inputs as JSON profile
+    with st.expander("Profiles"):
+        # Download current inputs
+        if "last_input_row" in st.session_state:
+            current_inputs = st.session_state["last_input_row"]
+        else:
+            # build from current session_state keys if available
+            current_inputs = {c: st.session_state.get(f"in_{c}", None) for c in display_features}
+
+        profile_json = json.dumps(current_inputs, ensure_ascii=False, indent=2)
+        st.download_button("Download current inputs as JSON", profile_json.encode("utf-8"),
+                           file_name="wheat_inputs_profile.json")
+
+        # Upload and prefill
+        up_profile = st.file_uploader("Load inputs profile (.json)", type=["json"], key="profile_uploader")
+        if up_profile is not None:
+            try:
+                prof = json.load(up_profile)
+                # write to session_state and rerun
+                for k, v in prof.items():
+                    st.session_state[f"in_{k}"] = v
+                st.success("Profile loaded into inputs.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to load profile: {e}")
+
+    # 2) Scenario comparison table
+    with st.expander("Scenario comparison"):
+        if "scenarios" not in st.session_state:
+            st.session_state["scenarios"] = []
+
+        scenario_name = st.text_input("Scenario name", value="Scenario 1")
+        if st.button("Add current inputs to Scenario List"):
+            # Build input strictly for model features
+            row = {k: st.session_state.get(f"in_{k}", None) for k in top_features}
+            row_df = pd.DataFrame([row], columns=top_features)
+            # fill
+            row_filled = row_df.fillna(row_df.iloc[0].dropna().median())
+            # predict
+            pred = float(predict_with_model(model, row_filled, top_features)[0])
+            rec = {"scenario": scenario_name, "predicted_yield": pred, **row_filled.iloc[0].to_dict()}
+            st.session_state["scenarios"].append(rec)
+
+        if st.session_state["scenarios"]:
+            sc_df = pd.DataFrame(st.session_state["scenarios"])
+            st.dataframe(sc_df)
+            st.download_button("Download scenarios as CSV",
+                               sc_df.to_csv(index=False).encode("utf-8"),
+                               file_name="scenarios.csv")
+            if st.button("Clear scenarios"):
+                st.session_state["scenarios"] = []
+                st.experimental_rerun()
+
+    # 3) SHAP explanation for the latest prediction
+    with st.expander("Explain current prediction (SHAP)"):
+        if "last_input_row" not in st.session_state:
+            st.info("Run a prediction in the Manual tab first.")
+        else:
+            row = pd.DataFrame([st.session_state["last_input_row"]], columns=top_features)
+            try:
+                pool = Pool(row[top_features])
+                shap_vals = model.get_feature_importance(type="ShapValues", data=pool)
+                # shap_vals shape: (1, n_features + 1); last col is expected value (bias)
+                contrib = shap_vals[0, :-1]
+                order = np.argsort(np.abs(contrib))[::-1][:10]
+                feats = [top_features[i] for i in order][::-1]
+                vals  = [contrib[i] for i in order][::-1]
+
+                fig, ax = plt.subplots(figsize=(7, 4))
+                ax.barh(feats, vals)
+                ax.set_xlabel("SHAP contribution")
+                ax.set_ylabel("Feature")
+                ax.set_title("Top 10 contributing features")
+                st.pyplot(fig)
+            except Exception as e:
+                st.error(f"Failed to compute SHAP values: {e}")
