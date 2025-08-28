@@ -7,12 +7,10 @@ import pandas as pd
 import numpy as np
 from catboost import CatBoostRegressor
 
-
 # ============ 页面设置 ============
 st.set_page_config(page_title="Wheat Yield Predictor", layout="centered")
 st.title("Wheat Yield Prediction (kg/hectare)")
 st.markdown("This application uses monthly weather data to estimate wheat yield per hectare.")
-
 
 # ============ 侧边栏：加载模型与特征 ============
 with st.sidebar:
@@ -27,6 +25,7 @@ model = None
 top_features = None
 
 def load_catboost_from_filelike(filelike) -> CatBoostRegressor:
+    """CatBoost 只能从路径加载：将 BytesIO 临时落盘。"""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".cbm") as tmp:
         tmp.write(filelike.read())
         tmp_path = tmp.name
@@ -35,6 +34,7 @@ def load_catboost_from_filelike(filelike) -> CatBoostRegressor:
     os.remove(tmp_path)
     return m
 
+# 模型
 try:
     if up_model is not None:
         model = load_catboost_from_filelike(up_model)
@@ -45,6 +45,7 @@ except Exception as e:
     st.sidebar.error(f"Failed to load model: {e}")
     model = None
 
+# 特征
 try:
     if up_feats is not None:
         top_features = json.load(up_feats)
@@ -60,7 +61,6 @@ if model is not None and top_features is not None:
 else:
     st.info("Please upload both the model file (.cbm) and the feature list (.json), "
             "or place them under ./models/ to begin.")
-
 
 # ============ 工具函数 ============
 def unit_label(col: str) -> str:
@@ -92,26 +92,20 @@ def group_features(feats: list[str]) -> dict[str, list[str]]:
 def predict_with_model(model: CatBoostRegressor, df: pd.DataFrame, feats: list[str]) -> np.ndarray:
     return model.predict(df[feats])
 
-
 # ============ 手动输入要显示的“常见字段池” ============
-# 会与 top_features 做并集，从而保证界面里一定出现降水/风速/日照等输入框
 DISPLAY_CANDIDATES = [
-    # 各生育期 温度/降水/日照/风速
     "sowingTmeanAvg","sowingPrecipSum","sowingSunHours","sowingWindAvg",
     "overwinterTmeanAvg","overwinterPrecipSum","overwinterSunHours","overwinterWindAvg",
     "jointingTmeanAvg","jointingPrecipSum","jointingSunHours","jointingWindAvg",
     "headingTmeanAvg","headingPrecipSum","headingSunHours","headingWindAvg",
     "fillingTmeanAvg","fillingPrecipSum","fillingSunHours","fillingWindAvg",
-    # 干旱/积温等
     "drynessJointing","drynessHeading","drynessFilling",
     "gddBase5","hddGt30","cddLt0",
 ]
 
-
-# ============ 主体：当模型与特征都就绪 ============
 if model is not None and top_features is not None:
 
-    # 最终用于“显示输入框”的特征集合：常见字段池 ∪ top_features（保持去重与顺序）
+    # 显示集合 = 常见字段池 ∪ top_features（去重，保持顺序）
     display_features = list(dict.fromkeys(DISPLAY_CANDIDATES + top_features))
 
     tab_batch, tab_manual = st.tabs(["Batch Prediction", "Manual Weather Input"])
@@ -181,44 +175,51 @@ if model is not None and top_features is not None:
             }
         }
 
-        demo_name = st.selectbox("Load example data", ["Manual Entry"] + list(demos.keys()))
+        # 选择示例后，把数值写入 session_state（使输入框真正被预填）
+        demo_name = st.selectbox("Load example data", ["Manual Entry"] + list(demos.keys()), key="demo_select")
         if demo_name != "Manual Entry":
-            st.info(f"Loaded values from: {demo_name}")
-            user_input = demos[demo_name].copy()
-        else:
-            user_input = {}
+            for k, v in demos[demo_name].items():
+                st.session_state[f"in_{k}"] = v
 
-        # 分组 + 布局（对 display_features，而非仅 top_features）
+        # 分组 + 布局
         groups = group_features(display_features)
+        user_input = {}
+
         for gname, cols in groups.items():
             st.markdown(f"**{gname}**")
             cols_container = st.columns(3)
+
             for i, c in enumerate(cols):
                 with cols_container[i % 3]:
                     label = unit_label(c)
-                    # 不在模型特征里的字段显示标记
                     if c not in top_features:
                         label = f"{label} (not used by model)"
-                    base = user_input.get(c, None)
+
                     lc = c.lower()
+                    key = f"in_{c}"   # 唯一 key，避免 DuplicateElementId
 
                     if "tmean" in lc:
-                        val = st.number_input(label, value=base, min_value=-30.0, max_value=45.0, step=0.1, format="%.1f")
+                        val = st.number_input(label, key=key,
+                                              min_value=-30.0, max_value=45.0, step=0.1, format="%.1f")
                     elif "precip" in lc:
-                        val = st.number_input(label, value=base, min_value=0.0, max_value=500.0, step=0.1, format="%.1f")
+                        val = st.number_input(label, key=key,
+                                              min_value=0.0, max_value=500.0, step=0.1, format="%.1f")
                     elif ("sun" in lc) or ("rad" in lc):
-                        val = st.number_input(label, value=base, min_value=0.0, max_value=400.0, step=0.1, format="%.1f")
+                        val = st.number_input(label, key=key,
+                                              min_value=0.0, max_value=400.0, step=0.1, format="%.1f")
                     elif ("wind" in lc) or ("ws" in lc):
-                        val = st.number_input(label, value=base, min_value=0.0, max_value=30.0, step=0.1, format="%.1f")
+                        val = st.number_input(label, key=key,
+                                              min_value=0.0, max_value=30.0, step=0.1, format="%.1f")
                     elif "dryness" in lc:
-                        val = st.number_input(label, value=base, min_value=0.0, max_value=2.0, step=0.01, format="%.2f")
+                        val = st.number_input(label, key=key,
+                                              min_value=0.0, max_value=2.0, step=0.01, format="%.2f")
                     else:
-                        val = st.number_input(label, value=base)
+                        val = st.number_input(label, key=key)
+
                     user_input[c] = val
 
-        # 仅用 top_features 列构造预测输入；其它字段仅用于展示
-        input_df = pd.DataFrame([{k: v for k, v in user_input.items() if k in top_features}], columns=top_features)
-        # 行中位数填补
+        # 仅用 top_features 构造预测输入；其它字段只展示
+        input_df = pd.DataFrame([{k: user_input.get(k, None) for k in top_features}], columns=top_features)
         row_median = input_df.iloc[0].dropna().median()
         input_df = input_df.fillna(row_median)
 
