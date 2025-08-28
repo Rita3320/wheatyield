@@ -75,8 +75,9 @@ if model is not None and top_features is not None:
     with tab2:
         st.subheader("Manually Input Monthly Weather Data")
 
+        # 示例数据
         demo_examples = {
-            "Example: Normal Year (Benchmark)": {
+            "Example: Normal Year": {
                 "sowingTmeanAvg": 12.3, "sowingPrecipSum": 45.0,
                 "overwinterTmeanAvg": 2.1, "overwinterPrecipSum": 18.0,
                 "jointingTmeanAvg": 15.7, "jointingPrecipSum": 38.0,
@@ -96,7 +97,7 @@ if model is not None and top_features is not None:
             }
         }
 
-        selected_demo = st.selectbox("Load example data:", ["Manual Entry"] + list(demo_examples.keys()))
+        selected_demo = st.selectbox("Load example data", ["Manual Entry"] + list(demo_examples.keys()))
         if selected_demo != "Manual Entry":
             st.info(f"Loaded values from: {selected_demo}")
             user_input = demo_examples[selected_demo].copy()
@@ -111,20 +112,19 @@ if model is not None and top_features is not None:
             "Heading Phase": [k for k in top_features if "heading" in k],
             "Filling Phase": [k for k in top_features if "filling" in k],
             "Dryness Indices": [k for k in top_features if "dryness" in k],
-            "Extreme Indicators": [k for k in top_features if any(s in k for s in ["gdd", "hdd", "cdd"])],
-            "Other Features": [k for k in top_features if k not in sum([
-                [*v] for v in [
-                    [k for k in top_features if "sowing" in k],
-                    [k for k in top_features if "overwinter" in k],
-                    [k for k in top_features if "jointing" in k],
-                    [k for k in top_features if "heading" in k],
-                    [k for k in top_features if "filling" in k],
-                    [k for k in top_features if "dryness" in k],
-                    [k for k in top_features if any(s in k for s in ["gdd", "hdd", "cdd"])]
-                ]
+            "Extreme Weather Indicators": [k for k in top_features if any(s in k for s in ["gdd", "hdd", "cdd"])],
+            "Other": [k for k in top_features if k not in sum([
+                [k for k in top_features if "sowing" in k],
+                [k for k in top_features if "overwinter" in k],
+                [k for k in top_features if "jointing" in k],
+                [k for k in top_features if "heading" in k],
+                [k for k in top_features if "filling" in k],
+                [k for k in top_features if "dryness" in k],
+                [k for k in top_features if any(s in k for s in ["gdd", "hdd", "cdd"])]
             ], [])]
         }
 
+        # 单位显示函数
         def get_unit_label(col):
             if "tmean" in col: return f"{col} [°C]"
             if "precip" in col: return f"{col} [mm]"
@@ -134,16 +134,17 @@ if model is not None and top_features is not None:
             if "dryness" in col: return f"{col} [ratio]"
             return col
 
+        # 输入区：分组 + 单位 + 分列
         for group, cols in phase_groups.items():
             if not cols:
                 continue
             st.markdown(f"**{group}**")
-            col_widgets = st.columns(3)
+            row_cols = st.columns(3)
             for i, col in enumerate(cols):
-                with col_widgets[i % 3]:
+                with row_cols[i % 3]:
                     label = get_unit_label(col)
-                    default = user_input.get(col, None)
-                    val = st.number_input(label, value=default)
+                    default_val = user_input.get(col, None)
+                    val = st.number_input(label, value=default_val)
                     user_input[col] = val
 
         input_df = pd.DataFrame([user_input])
