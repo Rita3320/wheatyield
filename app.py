@@ -1,7 +1,9 @@
 # app.py — Wheat Yield Prediction (cluster-aware with flat-file fallback)
-# 新增：Insight 段落（依据气候指纹 + TOP SHAP features）
+# 新增：
+#   - 单次预测 PDF 报告下载
+#   - 历史预测记录（会话内持久）并支持下载 CSV
 
-import os, io, re, json, joblib, zipfile, tempfile, random
+import os, io, re, json, joblib, zipfile, tempfile, random, datetime
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -266,7 +268,6 @@ def _mean_of(cols: List[str], row: pd.Series) -> Optional[float]:
     return float(np.mean(vals)) if vals else None
 
 def climate_fingerprint(row: pd.Series) -> Dict[str, str]:
-    # 取均值/简单阈值判别
     t_cols = [c for c in row.index if "tmean" in c.lower()]
     p_cols = [c for c in row.index if "precip" in c.lower()]
     s_cols = [c for c in row.index if ("sun" in c.lower() or "rad" in c.lower())]
@@ -285,7 +286,6 @@ def climate_fingerprint(row: pd.Series) -> Dict[str, str]:
 
 def insight_text(cluster: Optional[int], row: pd.Series, shap_df: pd.DataFrame) -> str:
     fp = climate_fingerprint(row)
-    # SHAP：正/负驱动 TOP3
     pos = shap_df.sort_values("shap", ascending=False)
     neg = shap_df.sort_values("shap", ascending=True)
     pos_names = [pos.iloc[i]["feature"] for i in range(min(3, len(pos))) if pos.iloc[i]["shap"] > 0]
@@ -293,34 +293,75 @@ def insight_text(cluster: Optional[int], row: pd.Series, shap_df: pd.DataFrame) 
 
     parts = []
     if cluster is not None:
-        parts.append(f"Detected climate cluster: **{cluster}**.")
-    parts.append(f"Climate fingerprint suggests **{fp['temp']} & {fp['moist']}**, "
-                 f"{fp['sun']} radiation and {fp['wind']} conditions.")
-
+        parts.append(f"Detected climate cluster: {cluster}.")
+    parts.append(f"Climate fingerprint: {fp['temp']} & {fp['moist']}, {fp['sun']} radiation, {fp['wind']} winds.")
     if pos_names:
-        parts.append("Strong positive drivers: " + ", ".join(pos_names) + ".")
+        parts.append("Positive drivers: " + ", ".join(pos_names) + ".")
     if neg_names:
         parts.append("Limiting factors: " + ", ".join(neg_names) + ".")
 
-    # 建议
     tips = []
     if fp["moist"] == "dry":
-        tips += ["prioritize irrigation scheduling", "use drought-tolerant cultivars", "mulch/retain soil moisture"]
+        tips += ["prioritize irrigation scheduling", "retain soil moisture (mulch)"]
     elif fp["moist"] == "wet":
-        tips += ["improve drainage after heavy rain", "tight disease scouting (rust/mildew)", "split nitrogen to avoid lodging"]
+        tips += ["improve drainage after rain", "tight disease scouting", "split nitrogen to avoid lodging"]
     if fp["temp"] == "hot":
-        tips += ["avoid heat stress near heading/filling (irrigate earlier in the day)"]
+        tips += ["mitigate heat stress near heading/filling"]
     elif fp["temp"] == "cool":
-        tips += ["watch for slow development; consider earlier-maturing varieties"]
+        tips += ["consider earlier-maturing varieties"]
     if fp["wind"] == "windy":
         tips += ["use lodging-resistant varieties or windbreaks"]
     if fp["sun"] == "cloudy":
-        tips += ["increase seeding density slightly to compensate for low radiation"]
+        tips += ["slightly increase seeding density"]
 
     if tips:
         parts.append("Suggested actions: " + "; ".join(tips) + ".")
-
     return " ".join(parts)
+
+# ---------- single PDF ----------
+def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
+                    meta: Dict[str, Any], top_items: List[Tuple[str, float]], insight: str) -> bytes:
+    try:
+        from fpdf import FPDF
+    except Exception as e:
+        raise RuntimeError("fpdf2 not installed. `pip install fpdf2` to enable PDF export.") from e
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "Wheat Yield Prediction — Single Report", ln=1)
+    pdf.set_font("Arial", "", 11)
+    pdf.cell(0, 8, f"Generated at: {timestamp}", ln=1)
+    pdf.cell(0, 8, f"Model: {cluster_disp}", ln=1)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, f"Predicted Yield: {predicted_yield:.3f} tons/ha", ln=1)
+
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 8, "Context:", ln=1)
+    pdf.set_font("Arial", "", 11)
+    for k in ["year","latitude","longitude","sown_area"]:
+        if k in meta and meta[k] is not None:
+            pdf.cell(0, 7, f"{k}: {meta[k]}", ln=1)
+
+    if top_items:
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 8, "Top SHAP features:", ln=1)
+        pdf.set_font("Arial", "", 11)
+        for name, val in top_items[:10]:
+            pdf.cell(0, 6, f"{name}: {val:+.4f}", ln=1)
+
+    if insight:
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 8, "Insight:", ln=1)
+        pdf.set_font("Arial", "", 11)
+        pdf.multi_cell(0, 6, insight)
+
+    out = io.BytesIO(); pdf.output(out)
+    return out.getvalue()
+
+# ---------- history store ----------
+if "history" not in st.session_state:
+    st.session_state["history"] = []  # list of dicts
 
 # ---------- UI ----------
 mode = st.sidebar.radio("Prediction Mode", ["Single prediction", "Batch prediction (CSV)"], index=0)
@@ -374,6 +415,8 @@ if mode == "Batch prediction (CSV)":
 
 else:
     st.subheader("Single prediction")
+
+    # context fields
     c1, c2 = st.columns(2)
     with c1:
         year = st.number_input("Year", min_value=1900, max_value=2100, value=2018, step=1, key="in_year")
@@ -382,7 +425,7 @@ else:
         latitude = st.number_input("Latitude", min_value=-90.0, max_value=90.0, value=34.75, step=0.01, format="%.2f", key="in_latitude")
         longitude = st.number_input("Longitude", min_value=-180.0, max_value=180.0, value=113.62, step=0.01, format="%.2f", key="in_longitude")
 
-    # --- Randomize controls ---
+    # randomizers
     st.markdown("**Auto-fill tools**")
     cc1, cc2, cc3, cc4 = st.columns([1,1,1,2])
     with cc4:
@@ -398,6 +441,7 @@ else:
         if st.button("Cool & Wet"):
             apply_random_to_session(DISPLAY_FEATURES, profile="cool_wet", seed=seed_val)
 
+    # inputs
     with st.expander("Weather and feature inputs"):
         groups = group_features(DISPLAY_FEATURES)
         rendered = set()
@@ -417,8 +461,9 @@ else:
                     elif "dryness" in lc: kwargs.update(min_value=0.0, max_value=2.0, step=0.01, format="%.2f")
                     st.number_input(**kwargs)
 
-    row = {k.replace("in_",""): v for k,v in st.session_state.items() if k.startswith("in_")}
-    row = pd.Series(row, dtype="float64")
+    # assemble row
+    row_full = {k.replace("in_",""): v for k,v in st.session_state.items() if k.startswith("in_")}
+    row = pd.Series(row_full, dtype="float64")
 
     clu = None
     if regressors:
@@ -433,10 +478,11 @@ else:
 
     if st.button("Predict"):
         try:
+            # predict
             yhat, feats, model = predict_yield(clu, row)
             st.markdown(f"### Predicted Yield: **{yhat:.3f} tons/ha**")
 
-            # SHAP & INSIGHT
+            # SHAP & Insight
             fig, shap_df = shap_single(row, feats, model, clu=clu)
             st.markdown("**SHAP explanation (Top-10 features):**")
             st.pyplot(fig)
@@ -445,8 +491,47 @@ else:
             st.markdown("**Insight**")
             st.info(insight)
 
-            st.download_button("Download SHAP CSV",
-                               shap_df.to_csv(index=False).encode("utf-8"),
-                               file_name="shap_top10.csv")
+            # 单次 PDF 报告
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cluster_disp = f"Clustered (cluster={clu})" if regressors else "Global model"
+            # 取 Top SHAP 列表
+            shap_sorted = shap_df.reindex(shap_df["shap"].abs().sort_values(ascending=False).index)
+            top_items = list(zip(shap_sorted["feature"].tolist(), shap_sorted["shap"].tolist()))
+            meta = {"year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area}
+            try:
+                pdf_bytes = make_pdf_single(ts, yhat, cluster_disp, meta, top_items, insight)
+                st.download_button("Download PDF report", data=pdf_bytes,
+                                   file_name=f"prediction_{ts.replace(':','-').replace(' ','_')}.pdf",
+                                   mime="application/pdf")
+            except Exception as e:
+                st.info(str(e))
+
+            # 历史记录（仅保存与当前模型相关的特征）
+            rec = {
+                "timestamp": ts,
+                "model_type": "clustered" if regressors else "global",
+                "cluster": clu if regressors else None,
+                "predicted_yield": yhat,
+                "year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area
+            }
+            for f in feats:
+                rec[f] = row_full.get(f, np.nan)
+            st.session_state["history"].append(rec)
+
         except Exception as e:
             st.error(str(e))
+
+    # 历史记录区块
+    st.markdown("---")
+    st.subheader("Prediction history (this session)")
+    if st.session_state["history"]:
+        hist_df = pd.DataFrame(st.session_state["history"])
+        st.dataframe(hist_df.sort_values("timestamp", ascending=False), use_container_width=True)
+        st.download_button("Download history CSV",
+                           hist_df.to_csv(index=False).encode("utf-8"),
+                           file_name="prediction_history.csv")
+        if st.button("Clear history"):
+            st.session_state["history"] = []
+            st.experimental_rerun()
+    else:
+        st.caption("No predictions yet.")
