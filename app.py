@@ -7,12 +7,14 @@ import pandas as pd
 import numpy as np
 from catboost import CatBoostRegressor
 
-# ============ 页面设置 ============
+
+# ================= Page =================
 st.set_page_config(page_title="Wheat Yield Predictor", layout="centered")
 st.title("Wheat Yield Prediction (kg/hectare)")
 st.markdown("This application uses monthly weather data to estimate wheat yield per hectare.")
 
-# ============ 侧边栏：加载模型与特征 ============
+
+# ================= Sidebar: load model & features =================
 with st.sidebar:
     st.header("Model and Feature Loader")
     up_model = st.file_uploader("Upload CatBoost model (.cbm)", type=["cbm"])
@@ -25,7 +27,7 @@ model = None
 top_features = None
 
 def load_catboost_from_filelike(filelike) -> CatBoostRegressor:
-    """CatBoost 只能从路径加载：将 BytesIO 临时落盘。"""
+    """CatBoost loads from a filepath; write the uploaded bytes to a temp file first."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".cbm") as tmp:
         tmp.write(filelike.read())
         tmp_path = tmp.name
@@ -34,7 +36,7 @@ def load_catboost_from_filelike(filelike) -> CatBoostRegressor:
     os.remove(tmp_path)
     return m
 
-# 模型
+# model
 try:
     if up_model is not None:
         model = load_catboost_from_filelike(up_model)
@@ -45,7 +47,7 @@ except Exception as e:
     st.sidebar.error(f"Failed to load model: {e}")
     model = None
 
-# 特征
+# features
 try:
     if up_feats is not None:
         top_features = json.load(up_feats)
@@ -59,22 +61,24 @@ except Exception as e:
 if model is not None and top_features is not None:
     st.sidebar.success(f"Model and feature list loaded. Features: {len(top_features)}")
 else:
-    st.info("Please upload both the model file (.cbm) and the feature list (.json), "
-            "or place them under ./models/ to begin.")
+    st.info("Please upload both the model file (.cbm) and the feature list (.json), or place them under ./models/ to begin.")
 
-# ============ 工具函数 ============
-def unit_label(col: str) -> str:
+
+# ================= Helpers =================
+def label_with_unit(col: str) -> str:
+    """English label = original feature name + unit only."""
     lc = col.lower()
-    if "tmean" in lc:   u = "[°C]"
-    elif "precip" in lc: u = "[mm]"
-    elif ("sun" in lc) or ("rad" in lc): u = "[hr]"
-    elif ("wind" in lc) or ("ws" in lc): u = "[m/s]"
-    elif any(k in lc for k in ["gdd", "hdd", "cdd"]): u = "[°C-days]"
-    elif "dryness" in lc: u = "[ratio]"
-    else: u = ""
-    return f"{col} {u}".strip()
+    if "tmean" in lc:   unit = "[°C]"
+    elif "precip" in lc: unit = "[mm]"
+    elif ("sun" in lc) or ("rad" in lc): unit = "[hr]"
+    elif ("wind" in lc) or ("ws" in lc): unit = "[m/s]"
+    elif any(k in lc for k in ["gdd", "hdd", "cdd"]): unit = "[°C-days]"
+    elif "dryness" in lc: unit = "[ratio]"
+    else: unit = ""
+    return f"{col} {unit}".strip()
 
 def group_features(feats: list[str]) -> dict[str, list[str]]:
+    """Group by lifecycle keywords for display only."""
     def has(s, key): return key in s.lower()
     groups = {
         "Sowing Phase":     [c for c in feats if has(c, "sowing")],
@@ -87,12 +91,15 @@ def group_features(feats: list[str]) -> dict[str, list[str]]:
     }
     used = set(sum(groups.values(), []))
     groups["Other Features"] = [c for c in feats if c not in used]
+    # drop empty groups
     return {k: v for k, v in groups.items() if v}
 
 def predict_with_model(model: CatBoostRegressor, df: pd.DataFrame, feats: list[str]) -> np.ndarray:
     return model.predict(df[feats])
 
-# ============ 手动输入要显示的“常见字段池” ============
+
+# ================= Display candidates for manual UI =================
+# Ensure precipitation / wind / sunshine inputs show up even if not in top_features
 DISPLAY_CANDIDATES = [
     "sowingTmeanAvg","sowingPrecipSum","sowingSunHours","sowingWindAvg",
     "overwinterTmeanAvg","overwinterPrecipSum","overwinterSunHours","overwinterWindAvg",
@@ -103,14 +110,16 @@ DISPLAY_CANDIDATES = [
     "gddBase5","hddGt30","cddLt0",
 ]
 
+
+# ================= Main =================
 if model is not None and top_features is not None:
 
-    # 显示集合 = 常见字段池 ∪ top_features（去重，保持顺序）
+    # union set for UI display (keep order, de-dup)
     display_features = list(dict.fromkeys(DISPLAY_CANDIDATES + top_features))
 
     tab_batch, tab_manual = st.tabs(["Batch Prediction", "Manual Weather Input"])
 
-    # ------- 批量预测 -------
+    # ----- Batch -----
     with tab_batch:
         st.subheader("Upload CSV File for Batch Prediction")
         st.markdown("The CSV must contain the following columns (model features):")
@@ -128,6 +137,7 @@ if model is not None and top_features is not None:
             else:
                 with st.spinner("Running prediction..."):
                     pred_df = df.copy()
+                    # row-wise median fill
                     row_medians = pred_df[top_features].median(axis=1)
                     pred_df[top_features] = pred_df[top_features].T.fillna(row_medians).T
                     preds = predict_with_model(model, pred_df, top_features)
@@ -140,11 +150,11 @@ if model is not None and top_features is not None:
                 csv_bytes = pred_df.to_csv(index=False).encode("utf-8")
                 st.download_button("Download Results as CSV", csv_bytes, file_name="predicted_yield.csv")
 
-    # ------- 手动输入 -------
+    # ----- Manual -----
     with tab_manual:
         st.subheader("Manually Enter Weather Data")
 
-        # 示例输入
+        # demo presets
         demos = {
             "Normal Year (Benchmark)": {
                 "sowingTmeanAvg": 12.3, "sowingPrecipSum": 45.0, "sowingSunHours": 160.0, "sowingWindAvg": 2.5,
@@ -175,51 +185,52 @@ if model is not None and top_features is not None:
             }
         }
 
-        # 选择示例后，把数值写入 session_state（使输入框真正被预填）
         demo_name = st.selectbox("Load example data", ["Manual Entry"] + list(demos.keys()), key="demo_select")
         if demo_name != "Manual Entry":
             for k, v in demos[demo_name].items():
                 st.session_state[f"in_{k}"] = v
 
-        # 分组 + 布局
         groups = group_features(display_features)
         user_input = {}
+        rendered = set()  # avoid duplicate widgets
 
         for gname, cols in groups.items():
             st.markdown(f"**{gname}**")
             cols_container = st.columns(3)
 
             for i, c in enumerate(cols):
-                with cols_container[i % 3]:
-                    label = unit_label(c)
-                    if c not in top_features:
-                        label = f"{label} (not used by model)"
+                if c in rendered:
+                    continue
+                rendered.add(c)
 
+                with cols_container[i % 3]:
+                    label = label_with_unit(c)
+                    key = f"in_{c}"
                     lc = c.lower()
-                    key = f"in_{c}"   # 唯一 key，避免 DuplicateElementId
+
+                    # build kwargs, only pass "value" if not None to avoid Streamlit warnings
+                    kwargs = {"key": key}
+                    base = st.session_state.get(key, None)
+                    if base is not None:
+                        kwargs["value"] = base
 
                     if "tmean" in lc:
-                        val = st.number_input(label, key=key,
-                                              min_value=-30.0, max_value=45.0, step=0.1, format="%.1f")
+                        kwargs["min_value"] = -30.0; kwargs["max_value"] = 45.0; kwargs["step"] = 0.1; kwargs["format"] = "%.1f"
                     elif "precip" in lc:
-                        val = st.number_input(label, key=key,
-                                              min_value=0.0, max_value=500.0, step=0.1, format="%.1f")
+                        kwargs["min_value"] = 0.0; kwargs["max_value"] = 500.0; kwargs["step"] = 0.1; kwargs["format"] = "%.1f"
                     elif ("sun" in lc) or ("rad" in lc):
-                        val = st.number_input(label, key=key,
-                                              min_value=0.0, max_value=400.0, step=0.1, format="%.1f")
+                        kwargs["min_value"] = 0.0; kwargs["max_value"] = 400.0; kwargs["step"] = 0.1; kwargs["format"] = "%.1f"
                     elif ("wind" in lc) or ("ws" in lc):
-                        val = st.number_input(label, key=key,
-                                              min_value=0.0, max_value=30.0, step=0.1, format="%.1f")
+                        kwargs["min_value"] = 0.0; kwargs["max_value"] = 30.0; kwargs["step"] = 0.1; kwargs["format"] = "%.1f"
                     elif "dryness" in lc:
-                        val = st.number_input(label, key=key,
-                                              min_value=0.0, max_value=2.0, step=0.01, format="%.2f")
-                    else:
-                        val = st.number_input(label, key=key)
+                        kwargs["min_value"] = 0.0; kwargs["max_value"] = 2.0; kwargs["step"] = 0.01; kwargs["format"] = "%.2f"
 
+                    val = st.number_input(label, **kwargs)
                     user_input[c] = val
 
-        # 仅用 top_features 构造预测输入；其它字段只展示
+        # Build input strictly with model features
         input_df = pd.DataFrame([{k: user_input.get(k, None) for k in top_features}], columns=top_features)
+        # row-wise median fill
         row_median = input_df.iloc[0].dropna().median()
         input_df = input_df.fillna(row_median)
 
