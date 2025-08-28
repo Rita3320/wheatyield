@@ -1,333 +1,323 @@
-import os
-import json
-import tempfile
-
+import os, json, io, datetime
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from catboost import CatBoostRegressor, Pool
+from catboost import CatBoostClassifier, CatBoostRegressor, Pool
 
+# =================== Page & Theme ===================
+st.set_page_config(page_title="Wheat Yield Predictor (Clustered)", layout="centered")
+st.title("Wheat Yield Prediction (kg/hectare) — Cluster-Aware")
 
-# ================= Page =================
-st.set_page_config(page_title="Wheat Yield Predictor", layout="centered")
-st.title("Wheat Yield Prediction (kg/hectare)")
-st.markdown("This application uses monthly weather data to estimate wheat yield per hectare.")
+# =================== Paths & Load ===================
+BASE = "models"
+REG_DIR = os.path.join(BASE, "regressors")
 
+def load_clf(path: str) -> CatBoostClassifier:
+    m = CatBoostClassifier(); m.load_model(path); return m
 
-# ================= Load model & features from disk only =================
-DEFAULT_MODEL = "models/cat_model.cbm" if os.path.exists("models/cat_model.cbm") else "cat_model.cbm"
-DEFAULT_FEATS  = "models/top_features.json" if os.path.exists("models/top_features.json") else "top_features.json"
+def load_reg(path: str) -> CatBoostRegressor:
+    m = CatBoostRegressor(); m.load_model(path); return m
 
-model = None
-top_features = None
-
-def load_catboost_from_path(path: str) -> CatBoostRegressor:
-    m = CatBoostRegressor()
-    m.load_model(path)
-    return m
-
-# load model
-if os.path.exists(DEFAULT_MODEL):
-    try:
-        model = load_catboost_from_path(DEFAULT_MODEL)
-    except Exception as e:
-        st.error(f"Failed to load model from '{DEFAULT_MODEL}': {e}")
-        st.stop()
-else:
-    st.error(f"Model file not found: '{DEFAULT_MODEL}'. Place the CatBoost .cbm file at this path.")
+req = {
+    "cluster_model": os.path.join(BASE, "cluster_model.cbm"),
+    "cluster_features": os.path.join(BASE, "cluster_features.json"),
+    "clusters": os.path.join(BASE, "clusters.json"),
+}
+missing = [k for k, p in req.items() if not os.path.exists(p)]
+if missing:
+    st.error(f"Missing model artifacts: {missing}. Please train/export clustered models first.")
     st.stop()
 
-# load features
-if os.path.exists(DEFAULT_FEATS):
-    try:
-        with open(DEFAULT_FEATS, "r", encoding="utf-8") as f:
-            top_features = json.load(f)
-        if not isinstance(top_features, list) or not all(isinstance(x, str) for x in top_features):
-            raise ValueError("top_features.json must be a JSON array of strings.")
-    except Exception as e:
-        st.error(f"Failed to load feature list from '{DEFAULT_FEATS}': {e}")
-        st.stop()
-else:
-    st.error(f"Feature list file not found: '{DEFAULT_FEATS}'. Place the JSON file at this path.")
+clf = load_clf(req["cluster_model"])
+with open(req["cluster_features"], "r", encoding="utf-8") as f:
+    clf_features: list[str] = json.load(f)
+
+with open(req["clusters"], "r", encoding="utf-8") as f:
+    clusters: list[int] = [int(x) for x in json.load(f)]
+
+regressors: dict[int, dict] = {}
+for clu in clusters:
+    m_path = os.path.join(REG_DIR, f"cluster_{clu}.cbm")
+    f_path = os.path.join(REG_DIR, f"top_features_cluster_{clu}.json")
+    if os.path.exists(m_path) and os.path.exists(f_path):
+        model = load_reg(m_path)
+        feats = json.load(open(f_path, "r", encoding="utf-8"))
+        regressors[int(clu)] = {"model": model, "features": feats}
+
+if not regressors:
+    st.error("No per-cluster regressors loaded under models/regressors/.")
     st.stop()
 
-
-# ================= Helpers =================
-def label_with_unit(col: str) -> str:
-    """English label = original feature name + unit only."""
-    lc = col.lower()
-    if "tmean" in lc:   unit = "[°C]"
-    elif "precip" in lc: unit = "[mm]"
-    elif ("sun" in lc) or ("rad" in lc): unit = "[hr]"
-    elif ("wind" in lc) or ("ws" in lc): unit = "[m/s]"
-    elif any(k in lc for k in ["gdd", "hdd", "cdd"]): unit = "[°C-days]"
-    elif "dryness" in lc: unit = "[ratio]"
-    else: unit = ""
-    return f"{col} {unit}".strip()
-
-def group_features(feats: list[str]) -> dict[str, list[str]]:
-    """Group by lifecycle keywords for display only."""
-    def has(s, key): return key in s.lower()
-    groups = {
-        "Sowing Phase":      [c for c in feats if has(c, "sowing")],
-        "Overwinter Phase":  [c for c in feats if has(c, "overwinter")],
-        "Jointing Phase":    [c for c in feats if has(c, "jointing")],
-        "Heading Phase":     [c for c in feats if has(c, "heading")],
-        "Filling Phase":     [c for c in feats if has(c, "filling")],
-        "Dryness Indices":   [c for c in feats if has(c, "dryness")],
-        "Extreme Indicators":[c for c in feats if any(k in c.lower() for k in ["gdd","hdd","cdd"])],
-    }
-    used = set(sum(groups.values(), []))
-    groups["Other Features"] = [c for c in feats if c not in used]
-    return {k: v for k, v in groups.items() if v}
-
-def predict_with_model(model: CatBoostRegressor, df: pd.DataFrame, feats: list[str]) -> np.ndarray:
-    return model.predict(df[feats])
-
-def validate_inputs(row: pd.Series) -> list[str]:
-    """Simple sanity checks; add/adjust as you like."""
-    warnings = []
-    for k, v in row.items():
-        if pd.isna(v):
-            continue
-        lk = k.lower()
-        if "tmean" in lk and not (-30.0 <= v <= 45.0):
-            warnings.append(f"{k} out of range (-30~45 °C): {v}")
-        if "precip" in lk and not (0.0 <= v <= 500.0):
-            warnings.append(f"{k} out of range (0~500 mm): {v}")
-        if ("sun" in lk or "rad" in lk) and not (0.0 <= v <= 400.0):
-            warnings.append(f"{k} out of range (0~400 hr): {v}")
-        if ("wind" in lk or "ws" in lk) and not (0.0 <= v <= 30.0):
-            warnings.append(f"{k} out of range (0~30 m/s): {v}")
-        if "dryness" in lk and not (0.0 <= v <= 2.0):
-            warnings.append(f"{k} out of range (0~2 ratio): {v}")
-    return warnings
-
-
-# ================= Display candidates for manual UI =================
-# ensure precipitation / wind / sunshine inputs appear even if not in top_features
-DISPLAY_CANDIDATES = [
+# union for UI display (keep order)
+COMMON_WEATHER = [
     "sowingTmeanAvg","sowingPrecipSum","sowingSunHours","sowingWindAvg",
     "overwinterTmeanAvg","overwinterPrecipSum","overwinterSunHours","overwinterWindAvg",
     "jointingTmeanAvg","jointingPrecipSum","jointingSunHours","jointingWindAvg",
     "headingTmeanAvg","headingPrecipSum","headingSunHours","headingWindAvg",
     "fillingTmeanAvg","fillingPrecipSum","fillingSunHours","fillingWindAvg",
-    "drynessJointing","drynessHeading","drynessFilling",
-    "gddBase5","hddGt30","cddLt0",
+    "drynessJointing","drynessHeading","drynessFilling","gddBase5","hddGt30","cddLt0",
 ]
+all_reg_feats = sorted(set(sum([v["features"] for v in regressors.values()], [])))
+DISPLAY_FEATURES = list(dict.fromkeys(COMMON_WEATHER + clf_features + all_reg_feats))
 
-# union for UI display (keep order and unique)
-display_features = list(dict.fromkeys(DISPLAY_CANDIDATES + top_features))
+# =================== Helpers ===================
+def label_with_unit(col: str) -> str:
+    lc = col.lower()
+    if "tmean" in lc:   u="[°C]"
+    elif "precip" in lc: u="[mm]"
+    elif ("sun" in lc) or ("rad" in lc): u="[hr]"
+    elif ("wind" in lc) or ("ws" in lc): u="[m/s]"
+    elif any(k in lc for k in ["gdd","hdd","cdd"]): u="[°C-days]"
+    elif "dryness" in lc: u="[ratio]"
+    else: u=""
+    return f"{col} {u}".strip()
 
-
-# ================= Tabs =================
-tab_batch, tab_manual, tab_insight = st.tabs(["Batch Prediction", "Manual Weather Input", "Insights & Scenarios"])
-
-# ----- Batch -----
-with tab_batch:
-    st.subheader("Upload CSV File for Batch Prediction")
-    st.markdown("The CSV must contain the following columns (model features):")
-    st.code(", ".join(top_features))
-
-    up_csv = st.file_uploader("Upload weather data CSV", type=["csv"])
-    if up_csv is not None:
-        df = pd.read_csv(up_csv)
-        st.markdown("Uploaded Preview:")
-        st.dataframe(df.head())
-
-        missing = [c for c in top_features if c not in df.columns]
-        if missing:
-            st.error(f"Missing required columns: {missing}")
-        else:
-            with st.spinner("Running prediction..."):
-                pred_df = df.copy()
-                row_medians = pred_df[top_features].median(axis=1)
-                pred_df[top_features] = pred_df[top_features].T.fillna(row_medians).T
-                preds = predict_with_model(model, pred_df, top_features)
-                pred_df["predicted_yield"] = preds
-
-            st.success("Prediction complete.")
-            st.markdown("Prediction Results:")
-            st.dataframe(pred_df[["predicted_yield"] + top_features])
-
-            csv_bytes = pred_df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download Results as CSV", csv_bytes, file_name="predicted_yield.csv")
-
-# ----- Manual -----
-with tab_manual:
-    st.subheader("Manually Enter Weather Data")
-
-    # demo presets
-    demos = {
-        "Normal Year (Benchmark)": {
-            "sowingTmeanAvg": 12.3, "sowingPrecipSum": 45.0, "sowingSunHours": 160.0, "sowingWindAvg": 2.5,
-            "overwinterTmeanAvg": 2.1, "overwinterPrecipSum": 18.0, "overwinterSunHours": 110.0, "overwinterWindAvg": 2.0,
-            "jointingTmeanAvg": 15.7, "jointingPrecipSum": 38.0, "jointingSunHours": 180.0, "jointingWindAvg": 2.8,
-            "headingTmeanAvg": 18.9, "headingPrecipSum": 42.0, "headingSunHours": 200.0, "headingWindAvg": 3.0,
-            "fillingTmeanAvg": 22.4, "fillingPrecipSum": 65.0, "fillingSunHours": 220.0, "fillingWindAvg": 3.2,
-            "drynessJointing": 0.4, "drynessHeading": 0.5, "drynessFilling": 0.2,
-            "gddBase5": 1600, "hddGt30": 3, "cddLt0": 20
-        },
-        "Cold Dry Winter": {
-            "sowingTmeanAvg": 10.0, "sowingPrecipSum": 20.0, "sowingSunHours": 150.0, "sowingWindAvg": 2.0,
-            "overwinterTmeanAvg": -3.0, "overwinterPrecipSum": 5.0, "overwinterSunHours": 90.0, "overwinterWindAvg": 1.8,
-            "jointingTmeanAvg": 14.0, "jointingPrecipSum": 25.0, "jointingSunHours": 170.0, "jointingWindAvg": 2.4,
-            "headingTmeanAvg": 17.0, "headingPrecipSum": 30.0, "headingSunHours": 185.0, "headingWindAvg": 2.6,
-            "fillingTmeanAvg": 21.0, "fillingPrecipSum": 55.0, "fillingSunHours": 210.0, "fillingWindAvg": 2.7,
-            "drynessJointing": 0.6, "drynessHeading": 0.7, "drynessFilling": 0.5,
-            "gddBase5": 1400, "hddGt30": 1, "cddLt0": 45
-        },
-        "Hot Wet Late Season": {
-            "sowingTmeanAvg": 13.0, "sowingPrecipSum": 50.0, "sowingSunHours": 165.0, "sowingWindAvg": 2.3,
-            "overwinterTmeanAvg": 1.5, "overwinterPrecipSum": 22.0, "overwinterSunHours": 115.0, "overwinterWindAvg": 2.1,
-            "jointingTmeanAvg": 17.0, "jointingPrecipSum": 45.0, "jointingSunHours": 190.0, "jointingWindAvg": 2.9,
-            "headingTmeanAvg": 20.5, "headingPrecipSum": 60.0, "headingSunHours": 210.0, "headingWindAvg": 3.1,
-            "fillingTmeanAvg": 25.0, "fillingPrecipSum": 110.0, "fillingSunHours": 235.0, "fillingWindAvg": 3.4,
-            "drynessJointing": 0.3, "drynessHeading": 0.35, "drynessFilling": 0.15,
-            "gddBase5": 1750, "hddGt30": 8, "cddLt0": 8
-        }
+def group_features(cols: list[str]) -> dict[str, list[str]]:
+    def has(s,k): return k in s.lower()
+    g = {
+        "Sowing Phase":      [c for c in cols if has(c,"sowing")],
+        "Overwinter Phase":  [c for c in cols if has(c,"overwinter")],
+        "Jointing Phase":    [c for c in cols if has(c,"jointing")],
+        "Heading Phase":     [c for c in cols if has(c,"heading")],
+        "Filling Phase":     [c for c in cols if has(c,"filling")],
+        "Dryness Indices":   [c for c in cols if has(c,"dryness")],
+        "Extreme Indicators":[c for c in cols if any(t in c.lower() for t in ["gdd","hdd","cdd"])],
+        "Other Features":    [c for c in cols if not any(x in c.lower() for x in
+                                ["sowing","overwinter","jointing","heading","filling","dryness","gdd","hdd","cdd"])],
     }
+    return {k:v for k,v in g.items() if v}
 
-    demo_name = st.selectbox("Load example data", ["Manual Entry"] + list(demos.keys()), key="demo_select")
-    if demo_name != "Manual Entry":
-        for k, v in demos[demo_name].items():
-            st.session_state[f"in_{k}"] = v
-        st.rerun()
+def predict_cluster(row: pd.Series) -> int:
+    r = row.reindex(clf_features)
+    med = r.dropna().median()
+    r = r.fillna(med)
+    proba = clf.predict(Pool(pd.DataFrame([r], columns=clf_features)))
+    return int(proba[0])
 
-    groups = group_features(display_features)
-    user_input = {}
-    rendered = set()  # avoid duplicate widgets if a feature appears in multiple groups
+def predict_yield_for_cluster(clu: int, row: pd.Series) -> float:
+    feats = regressors[clu]["features"]
+    X = row.reindex(feats)
+    med = X.dropna().median()
+    X = X.fillna(med)
+    yhat = float(regressors[clu]["model"].predict(Pool(pd.DataFrame([X], columns=feats)))[0])
+    return yhat
 
-    for gname, cols in groups.items():
-        st.markdown(f"**{gname}**")
-        cols_container = st.columns(3)
+def simple_insight(row: pd.Series) -> str:
+    t = float(row.get("fillingTmeanAvg", np.nan)) if row.get("fillingTmeanAvg") is not None else np.nan
+    p = float(row.get("fillingPrecipSum", np.nan)) if row.get("fillingPrecipSum") is not None else np.nan
+    if not np.isnan(t) and not np.isnan(p):
+        if t >= 24 and p <= 60: return "Insight: Hot and dry climate. Drought-resistant varieties perform better."
+        if t <= 16 and p >= 100: return "Insight: Cool and wet conditions. Slow-maturing varieties may be favored."
+    return "Insight: Adjust cultivar and management according to seasonal temperature and rainfall."
 
-        for i, c in enumerate(cols):
-            if c in rendered:
+def figure_cluster_importance(clu: int):
+    feats = regressors[clu]["features"]
+    model = regressors[clu]["model"]
+    try:
+        fi = model.get_feature_importance()
+    except Exception:
+        fi = np.zeros(len(feats))
+    order = np.argsort(fi)[::-1][:min(15, len(feats))]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.barh([feats[i] for i in order][::-1], [fi[i] for i in order][::-1])
+    ax.set_xlabel("Feature importance")
+    ax.set_title(f"Cluster {clu} — Top features")
+    fig.tight_layout()
+    return fig
+
+def make_pdf(report: dict) -> bytes:
+    try:
+        from fpdf import FPDF
+    except Exception as e:
+        raise RuntimeError("fpdf2 not installed. `pip install fpdf2` to enable PDF export.") from e
+    pdf = FPDF(); pdf.add_page(); pdf.set_font("Arial", size=14)
+    pdf.cell(0, 10, "Wheat Yield Prediction Report", ln=1)
+    pdf.set_font("Arial", size=11)
+    for k in ["timestamp","cluster","predicted_yield","latitude","longitude","sown_area","year","insight"]:
+        if k in report:
+            pdf.multi_cell(0, 8, f"{k.replace('_',' ').title()}: {report[k]}")
+    pdf.ln(4); pdf.set_font("Arial", "B", 12); pdf.cell(0, 8, "Key Inputs:", ln=1)
+    pdf.set_font("Arial", size=10)
+    for k,v in report.get("inputs", {}).items():
+        pdf.multi_cell(0, 6, f"- {k}: {v}")
+    out = io.BytesIO(); pdf.output(out); return out.getvalue()
+
+# =================== Sidebar: Prediction Mode ===================
+mode = st.sidebar.radio("Prediction Mode", ["Single prediction", "Batch prediction (CSV)"], index=0)
+
+# init history
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+
+# =================== Main Content ===================
+if mode == "Batch prediction (CSV)":
+    st.subheader("Clustered Batch Prediction")
+    st.markdown("If your CSV has a `cluster` column, it will be used; otherwise the app will auto-detect the cluster.")
+    st.markdown("**Required columns for cluster detection (when `cluster` is missing):**")
+    st.code(", ".join(sorted(set(clf_features))))
+    up = st.file_uploader("Upload CSV", type=["csv"])
+    if up:
+        df = pd.read_csv(up)
+        out_rows = []
+        for i, row in df.iterrows():
+            # detect or use provided cluster
+            clu = None
+            if "cluster" in df.columns and not pd.isna(row["cluster"]):
+                try: clu = int(row["cluster"])
+                except: clu = None
+            if clu is None:
+                clu = predict_cluster(row)
+
+            if clu not in regressors:
+                out_rows.append({"_row": i, "cluster": clu, "predicted_yield": np.nan, "_error":"no model for this cluster"})
                 continue
-            rendered.add(c)
 
-            with cols_container[i % 3]:
-                label = label_with_unit(c)
-                key = f"in_{c}"
-                lc = c.lower()
+            yhat = predict_yield_for_cluster(clu, row)
+            out_rows.append({"_row": i, "cluster": clu, "predicted_yield": yhat})
 
-                # Only key + ranges; DO NOT pass value= (we rely on session_state if any)
-                kwargs = {"key": key}
-                if "tmean" in lc:
-                    kwargs.update(min_value=-30.0, max_value=45.0, step=0.1, format="%.1f")
-                elif "precip" in lc:
-                    kwargs.update(min_value=0.0, max_value=500.0, step=0.1, format="%.1f")
-                elif ("sun" in lc) or ("rad" in lc):
-                    kwargs.update(min_value=0.0, max_value=400.0, step=0.1, format="%.1f")
-                elif ("wind" in lc) or ("ws" in lc):
-                    kwargs.update(min_value=0.0, max_value=30.0, step=0.1, format="%.1f")
-                elif "dryness" in lc:
-                    kwargs.update(min_value=0.0, max_value=2.0, step=0.01, format="%.2f")
+        res = pd.DataFrame(out_rows)
+        st.markdown("Predictions:")
+        st.dataframe(res)
+        st.download_button("Download results CSV", res.to_csv(index=False).encode("utf-8"),
+                           file_name="clustered_predictions.csv")
 
-                val = st.number_input(label, **kwargs)
-                user_input[c] = val
+else:
+    # ======= Tabs for single prediction =======
+    tab_predict, tab_map, tab_cluster, tab_hist = st.tabs(["Predict", "Climate Map", "Cluster Plot", "History"])
 
-    # Build input strictly with model features
-    input_df = pd.DataFrame([{k: user_input.get(k, None) for k in top_features}], columns=top_features)
+    # -------- Predict Tab --------
+    with tab_predict:
+        st.subheader("Inputs")
 
-    # Input validation (before fill)
-    warnings = validate_inputs(input_df.iloc[0])
-    if warnings:
-        st.warning("Input warnings:\n- " + "\n- ".join(warnings))
+        # Basic context (not necessarily in the model; for report & map)
+        col1, col2 = st.columns(2)
+        with col1:
+            year = st.number_input("Year", key="in_year", min_value=1900, max_value=2100, value=2018, step=1)
+            sown_area = st.number_input("Sown area (ha)", key="in_sown_area", min_value=0.0, value=1000.0, step=10.0, format="%.2f")
+        with col2:
+            latitude = st.number_input("Latitude", key="in_latitude", min_value=-90.0, max_value=90.0, value=34.75, step=0.01, format="%.2f")
+            longitude = st.number_input("Longitude", key="in_longitude", min_value=-180.0, max_value=180.0, value=113.62, step=0.01, format="%.2f")
 
-    # row-wise median fill
-    row_median = input_df.iloc[0].dropna().median()
-    input_df_filled = input_df.fillna(row_median)
+        st.checkbox("Auto-detect climate cluster", value=True, key="auto_detect_cluster")
 
-    st.markdown("Final Input Used For Prediction (after filling missing values):")
-    st.dataframe(input_df_filled)
+        # Weather & other features (collapsible)
+        with st.expander("Weather and feature inputs"):
+            groups = group_features(DISPLAY_FEATURES)
+            user_input = {}
+            rendered = set()
+            for gname, cols in groups.items():
+                st.markdown(f"**{gname}**")
+                cols3 = st.columns(3)
+                for i, c in enumerate(cols):
+                    if c in rendered: continue
+                    rendered.add(c)
+                    with cols3[i % 3]:
+                        key = f"in_{c}"
+                        lc = c.lower()
+                        kwargs = {"key": key, "label": label_with_unit(c)}
+                        if "tmean" in lc:
+                            kwargs.update(min_value=-30.0, max_value=45.0, step=0.1, format="%.1f")
+                        elif "precip" in lc:
+                            kwargs.update(min_value=0.0, max_value=500.0, step=0.1, format="%.1f")
+                        elif ("sun" in lc) or ("rad" in lc):
+                            kwargs.update(min_value=0.0, max_value=400.0, step=0.1, format="%.1f")
+                        elif ("wind" in lc) or ("ws" in lc):
+                            kwargs.update(min_value=0.0, max_value=30.0, step=0.1, format="%.1f")
+                        elif "dryness" in lc:
+                            kwargs.update(min_value=0.0, max_value=2.0, step=0.01, format="%.2f")
+                        val = st.number_input(**kwargs)
+                        user_input[c] = val
 
-    if st.button("Predict Yield"):
-        with st.spinner("Running prediction..."):
-            yhat = predict_with_model(model, input_df_filled, top_features)[0]
-        st.success(f"Predicted Yield per Hectare: {yhat:.2f} tons")
-        st.session_state["last_prediction"] = float(yhat)
-        st.session_state["last_input_row"] = input_df_filled.iloc[0].to_dict()
+        # Build a single row (all possible keys)
+        current_row = {k.replace("in_",""): v for k, v in st.session_state.items() if k.startswith("in_")}
+        row_series = pd.Series(current_row, dtype="float64")  # non-numeric will become NaN, OK for CatBoost
 
-# ----- Insights & Scenarios -----
-with tab_insight:
-    st.subheader("Insights and Scenarios")
+        # Detect cluster (button)
+        if st.button("Detect cluster"):
+            detected = predict_cluster(row_series)
+            st.session_state["detected_cluster"] = detected
+            st.success(f"Detected cluster: {detected}")
 
-    # 1) Save / Load current inputs as JSON profile
-    with st.expander("Profiles"):
-        # Download current inputs
-        if "last_input_row" in st.session_state:
-            current_inputs = st.session_state["last_input_row"]
+        # Decide cluster
+        if st.session_state.get("auto_detect_cluster", True):
+            cluster_to_use = st.session_state.get("detected_cluster", predict_cluster(row_series))
         else:
-            # build from current session_state keys if available
-            current_inputs = {c: st.session_state.get(f"in_{c}", None) for c in display_features}
+            cluster_to_use = st.selectbox("Select cluster", options=sorted(regressors.keys()), key="manual_cluster")
 
-        profile_json = json.dumps(current_inputs, ensure_ascii=False, indent=2)
-        st.download_button("Download current inputs as JSON", profile_json.encode("utf-8"),
-                           file_name="wheat_inputs_profile.json")
+        st.write("")  # spacer
 
-        # Upload and prefill
-        up_profile = st.file_uploader("Load inputs profile (.json)", type=["json"], key="profile_uploader")
-        if up_profile is not None:
-            try:
-                prof = json.load(up_profile)
-                # write to session_state and rerun
-                for k, v in prof.items():
-                    st.session_state[f"in_{k}"] = v
-                st.success("Profile loaded into inputs.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed to load profile: {e}")
+        # Predict button
+        if st.button("Predict"):
+            if cluster_to_use not in regressors:
+                st.error("No regressor available for the selected/predicted cluster.")
+            else:
+                yhat = predict_yield_for_cluster(cluster_to_use, row_series)
+                st.markdown(f"### Predicted Yield: **{yhat:.3f} tons/ha**")
 
-    # 2) Scenario comparison table
-    with st.expander("Scenario comparison"):
-        if "scenarios" not in st.session_state:
-            st.session_state["scenarios"] = []
+                insight = simple_insight(row_series)
+                st.write(insight)
 
-        scenario_name = st.text_input("Scenario name", value="Scenario 1")
-        if st.button("Add current inputs to Scenario List"):
-            # Build input strictly for model features
-            row = {k: st.session_state.get(f"in_{k}", None) for k in top_features}
-            row_df = pd.DataFrame([row], columns=top_features)
-            # fill
-            row_filled = row_df.fillna(row_df.iloc[0].dropna().median())
-            # predict
-            pred = float(predict_with_model(model, row_filled, top_features)[0])
-            rec = {"scenario": scenario_name, "predicted_yield": pred, **row_filled.iloc[0].to_dict()}
-            st.session_state["scenarios"].append(rec)
+                # Save to history
+                rec = {
+                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "cluster": int(cluster_to_use),
+                    "predicted_yield": float(yhat),
+                    "latitude": float(latitude),
+                    "longitude": float(longitude),
+                    "sown_area": float(sown_area),
+                    "year": int(year),
+                    "insight": insight,
+                    "inputs": {k: row_series.get(k, None) for k in DISPLAY_FEATURES}
+                }
+                st.session_state["history"].append(rec)
 
-        if st.session_state["scenarios"]:
-            sc_df = pd.DataFrame(st.session_state["scenarios"])
-            st.dataframe(sc_df)
-            st.download_button("Download scenarios as CSV",
-                               sc_df.to_csv(index=False).encode("utf-8"),
-                               file_name="scenarios.csv")
-            if st.button("Clear scenarios"):
-                st.session_state["scenarios"] = []
+                # PDF download
+                try:
+                    pdf_bytes = make_pdf(rec)
+                    st.download_button("Download PDF", data=pdf_bytes, file_name="yield_report.pdf", mime="application/pdf")
+                except Exception as e:
+                    st.info(str(e))
+
+    # -------- Climate Map Tab --------
+    with tab_map:
+        st.subheader("Climate Map")
+        if "in_latitude" in st.session_state and "in_longitude" in st.session_state:
+            lat = float(st.session_state["in_latitude"])
+            lon = float(st.session_state["in_longitude"])
+            st.map(pd.DataFrame({"lat":[lat], "lon":[lon]}), latitude="lat", longitude="lon", zoom=6)
+            clu = st.session_state.get("detected_cluster", None)
+            if clu is not None:
+                st.caption(f"Location marker. Detected cluster: {clu}")
+        else:
+            st.info("Provide latitude and longitude in the Predict tab to show the map.")
+
+    # -------- Cluster Plot Tab --------
+    with tab_cluster:
+        st.subheader("Cluster Plot")
+        clu = st.session_state.get("detected_cluster", None)
+        if clu is None:
+            row_series = pd.Series({k.replace("in_",""): v for k, v in st.session_state.items() if k.startswith("in_")})
+            clu = predict_cluster(row_series)
+        if clu not in regressors:
+            st.info("No regressor for this cluster.")
+        else:
+            fig = figure_cluster_importance(clu)
+            st.pyplot(fig)
+
+    # -------- History Tab --------
+    with tab_hist:
+        st.subheader("History")
+        if not st.session_state["history"]:
+            st.info("No predictions yet.")
+        else:
+            hist_df = pd.DataFrame([
+                {k: v for k, v in r.items() if k != "inputs"} for r in st.session_state["history"]
+            ])
+            st.dataframe(hist_df)
+            st.download_button("Download History CSV",
+                               hist_df.to_csv(index=False).encode("utf-8"),
+                               file_name="prediction_history.csv")
+            if st.button("Clear history"):
+                st.session_state["history"] = []
                 st.experimental_rerun()
-
-    # 3) SHAP explanation for the latest prediction
-    with st.expander("Explain current prediction (SHAP)"):
-        if "last_input_row" not in st.session_state:
-            st.info("Run a prediction in the Manual tab first.")
-        else:
-            row = pd.DataFrame([st.session_state["last_input_row"]], columns=top_features)
-            try:
-                pool = Pool(row[top_features])
-                shap_vals = model.get_feature_importance(type="ShapValues", data=pool)
-                # shap_vals shape: (1, n_features + 1); last col is expected value (bias)
-                contrib = shap_vals[0, :-1]
-                order = np.argsort(np.abs(contrib))[::-1][:10]
-                feats = [top_features[i] for i in order][::-1]
-                vals  = [contrib[i] for i in order][::-1]
-
-                fig, ax = plt.subplots(figsize=(7, 4))
-                ax.barh(feats, vals)
-                ax.set_xlabel("SHAP contribution")
-                ax.set_ylabel("Feature")
-                ax.set_title("Top 10 contributing features")
-                st.pyplot(fig)
-            except Exception as e:
-                st.error(f"Failed to compute SHAP values: {e}")
