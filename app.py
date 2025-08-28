@@ -1,10 +1,7 @@
 # app.py — Wheat Yield Prediction (cluster-aware with flat-file fallback)
-# 支持两种文件组织：
-# 1) 分簇：cluster_#.pkl/.joblib/.cbm + top_features_cluster_#.json（可放根目录或 models/regressors/）
-# 2) 全局：cat_model.pkl/.cbm + top_features.json/.pkl（放根目录或 models/）
-# 若存在分类器三件（cluster_model.cbm + cluster_features.json + cluster_cat_features.json），则启用自动判簇
+# 新增：Weather & feature inputs 一键随机/情景填充（Randomize / Hot & Dry / Cool & Wet）
 
-import os, io, re, json, joblib, zipfile, tempfile
+import os, io, re, json, joblib, zipfile, tempfile, random
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -38,7 +35,7 @@ clf_features_path = find_first(["cluster_features.json", os.path.join(MODELS_DIR
 clf_cat_features_path = find_first(["cluster_cat_features.json", os.path.join(MODELS_DIR, "cluster_cat_features.json")])
 
 HAS_CLF = all([clf_model_path, clf_features_path, clf_cat_features_path])
-clf = None; clf_features = []; clf_cat_features = []
+clf = None; clf_features: List[str] = []; clf_cat_features: List[str] = []
 if HAS_CLF:
     try:
         clf = CatBoostClassifier(); clf.load_model(clf_model_path)
@@ -151,6 +148,83 @@ def group_features(cols: List[str]) -> Dict[str, List[str]]:
     }
     return {k:v for k,v in g.items() if v}
 
+# ---------- Random generators ----------
+def _rand(a: float, b: float) -> float:
+    return random.uniform(a, b)
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+# 统一的控件范围（与 number_input 配套）
+RANGE = {
+    "tmean":   (-30.0, 45.0),
+    "precip":  (0.0,   500.0),
+    "sun":     (0.0,   400.0),
+    "wind":    (0.0,   30.0),
+    "dryness": (0.0,   2.0),
+    "gdd":     (0.0,   1500.0),
+    "hdd":     (0.0,   300.0),
+    "cdd":     (0.0,   500.0),
+}
+
+def random_value_for_feature(name: str, profile: str = "random") -> float:
+    lc = name.lower()
+
+    # 基础分布（按阶段略微调整）
+    if "tmean" in lc:
+        if "overwinter" in lc: base = _rand(-10, 8)
+        elif "filling" in lc or "heading" in lc: base = _rand(15, 28)
+        else: base = _rand(5, 25)
+        lo, hi = RANGE["tmean"]
+    elif "precip" in lc:
+        if "overwinter" in lc: base = _rand(5, 120)
+        else: base = _rand(10, 200)
+        lo, hi = RANGE["precip"]
+    elif ("sun" in lc) or ("rad" in lc):
+        if "overwinter" in lc: base = _rand(30, 180)
+        else: base = _rand(120, 320)
+        lo, hi = RANGE["sun"]
+    elif ("wind" in lc) or ("ws" in lc):
+        base = _rand(0.5, 8.0)
+        lo, hi = RANGE["wind"]
+    elif "dryness" in lc:
+        base = _rand(0.2, 1.2)
+        lo, hi = RANGE["dryness"]
+    elif "gdd" in lc:
+        base = _rand(100, 900)
+        lo, hi = RANGE["gdd"]
+    elif "hdd" in lc:
+        base = _rand(0, 120)
+        lo, hi = RANGE["hdd"]
+    elif "cdd" in lc:
+        base = _rand(10, 300)
+        lo, hi = RANGE["cdd"]
+    else:
+        base = 0.0; lo, hi = 0.0, 1e9  # 兜底
+
+    # 情景修正
+    if profile == "hot_dry":
+        if "tmean" in lc: base += 5
+        if "precip" in lc: base *= 0.55
+        if "sun" in lc: base += 40
+        if "dryness" in lc: base += 0.3
+        if "gdd" in lc: base *= 1.2
+    elif profile == "cool_wet":
+        if "tmean" in lc: base -= 5
+        if "precip" in lc: base *= 1.4
+        if "sun" in lc: base -= 40
+        if "dryness" in lc: base -= 0.2
+        if "gdd" in lc: base *= 0.85
+
+    return _clamp(float(base), lo, hi)
+
+def apply_random_to_session(features: List[str], profile: str = "random", seed: Optional[int] = None):
+    if seed is not None:
+        random.seed(int(seed))
+        np.random.seed(int(seed))
+    for c in features:
+        st.session_state[f"in_{c}"] = round(random_value_for_feature(c, profile), 2)
+
 # ---------- predict helpers ----------
 def predict_cluster(row: pd.Series) -> Optional[int]:
     if not HAS_CLF: return None
@@ -160,8 +234,7 @@ def predict_cluster(row: pd.Series) -> Optional[int]:
     med = r.loc[num_cols].dropna().median()
     r.loc[num_cols] = r.loc[num_cols].fillna(med)
     for c in clf_cat_features:
-        v = r.get(c)
-        r[c] = "NA" if pd.isna(v) else str(v)
+        v = r.get(c); r[c] = "NA" if pd.isna(v) else str(v)
     pool = Pool(pd.DataFrame([r], columns=clf_features), cat_features=clf_cat_features)
     return int(clf.predict(pool)[0])
 
@@ -172,14 +245,12 @@ def predict_yield(clu: Optional[int], row: pd.Series) -> Tuple[float, List[str],
         feats = regressors[clu]["features"]; model = regressors[clu]["model"]
     else:
         feats = global_regressor["features"]; model = global_regressor["model"]
-    X = row.reindex(feats)
-    X = X.fillna(X.dropna().median())
+    X = row.reindex(feats); X = X.fillna(X.dropna().median())
     yhat = float(model.predict(pd.DataFrame([X], columns=feats))[0])
     return yhat, feats, model
 
 def shap_single(row: pd.Series, feats: List[str], model: Any, clu: Optional[int]=None):
-    X = row.reindex(feats)
-    X = X.fillna(X.dropna().median())
+    X = row.reindex(feats).fillna(row.reindex(feats).dropna().median())
     df1 = pd.DataFrame([X], columns=feats)
     try:
         if isinstance(model, CatBoostRegressor):
@@ -261,6 +332,22 @@ else:
     with c2:
         latitude = st.number_input("Latitude", min_value=-90.0, max_value=90.0, value=34.75, step=0.01, format="%.2f", key="in_latitude")
         longitude = st.number_input("Longitude", min_value=-180.0, max_value=180.0, value=113.62, step=0.01, format="%.2f", key="in_longitude")
+
+    # --- Randomize controls ---
+    st.markdown("**Auto-fill tools**")
+    cc1, cc2, cc3, cc4 = st.columns([1,1,1,2])
+    with cc4:
+        seed = st.number_input("Random seed (optional)", min_value=0, max_value=10_000_000, value=0, step=1, key="rand_seed")
+        seed_val = int(seed) if seed != 0 else None
+    with cc1:
+        if st.button("Randomize"):
+            apply_random_to_session(DISPLAY_FEATURES, profile="random", seed=seed_val)
+    with cc2:
+        if st.button("Hot & Dry"):
+            apply_random_to_session(DISPLAY_FEATURES, profile="hot_dry", seed=seed_val)
+    with cc3:
+        if st.button("Cool & Wet"):
+            apply_random_to_session(DISPLAY_FEATURES, profile="cool_wet", seed=seed_val)
 
     with st.expander("Weather and feature inputs"):
         groups = group_features(DISPLAY_FEATURES)
