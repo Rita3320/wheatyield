@@ -1,5 +1,5 @@
 # app.py — Wheat Yield Prediction (cluster-aware with flat-file fallback)
-# 新增：Weather & feature inputs 一键随机/情景填充（Randomize / Hot & Dry / Cool & Wet）
+# 新增：Insight 段落（依据气候指纹 + TOP SHAP features）
 
 import os, io, re, json, joblib, zipfile, tempfile, random
 import streamlit as st
@@ -151,11 +151,9 @@ def group_features(cols: List[str]) -> Dict[str, List[str]]:
 # ---------- Random generators ----------
 def _rand(a: float, b: float) -> float:
     return random.uniform(a, b)
-
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-# 统一的控件范围（与 number_input 配套）
 RANGE = {
     "tmean":   (-30.0, 45.0),
     "precip":  (0.0,   500.0),
@@ -169,8 +167,6 @@ RANGE = {
 
 def random_value_for_feature(name: str, profile: str = "random") -> float:
     lc = name.lower()
-
-    # 基础分布（按阶段略微调整）
     if "tmean" in lc:
         if "overwinter" in lc: base = _rand(-10, 8)
         elif "filling" in lc or "heading" in lc: base = _rand(15, 28)
@@ -185,24 +181,17 @@ def random_value_for_feature(name: str, profile: str = "random") -> float:
         else: base = _rand(120, 320)
         lo, hi = RANGE["sun"]
     elif ("wind" in lc) or ("ws" in lc):
-        base = _rand(0.5, 8.0)
-        lo, hi = RANGE["wind"]
+        base = _rand(0.5, 8.0); lo, hi = RANGE["wind"]
     elif "dryness" in lc:
-        base = _rand(0.2, 1.2)
-        lo, hi = RANGE["dryness"]
+        base = _rand(0.2, 1.2); lo, hi = RANGE["dryness"]
     elif "gdd" in lc:
-        base = _rand(100, 900)
-        lo, hi = RANGE["gdd"]
+        base = _rand(100, 900); lo, hi = RANGE["gdd"]
     elif "hdd" in lc:
-        base = _rand(0, 120)
-        lo, hi = RANGE["hdd"]
+        base = _rand(0, 120); lo, hi = RANGE["hdd"]
     elif "cdd" in lc:
-        base = _rand(10, 300)
-        lo, hi = RANGE["cdd"]
+        base = _rand(10, 300); lo, hi = RANGE["cdd"]
     else:
-        base = 0.0; lo, hi = 0.0, 1e9  # 兜底
-
-    # 情景修正
+        base = 0.0; lo, hi = 0.0, 1e9
     if profile == "hot_dry":
         if "tmean" in lc: base += 5
         if "precip" in lc: base *= 0.55
@@ -215,13 +204,11 @@ def random_value_for_feature(name: str, profile: str = "random") -> float:
         if "sun" in lc: base -= 40
         if "dryness" in lc: base -= 0.2
         if "gdd" in lc: base *= 0.85
-
     return _clamp(float(base), lo, hi)
 
 def apply_random_to_session(features: List[str], profile: str = "random", seed: Optional[int] = None):
     if seed is not None:
-        random.seed(int(seed))
-        np.random.seed(int(seed))
+        random.seed(int(seed)); np.random.seed(int(seed))
     for c in features:
         st.session_state[f"in_{c}"] = round(random_value_for_feature(c, profile), 2)
 
@@ -273,19 +260,67 @@ def shap_single(row: pd.Series, feats: List[str], model: Any, clu: Optional[int]
     shap_df = pd.DataFrame({"feature":[feats[i] for i in order], "shap":[float(contrib[i]) for i in order]})
     return fig, shap_df
 
-def make_pdf_batch(rows: List[Dict[str, Any]]) -> bytes:
-    from fpdf import FPDF
-    pdf = FPDF()
-    for r in rows:
-        pdf.add_page(); pdf.set_font("Arial", size=14)
-        pdf.cell(0, 10, "Wheat Yield Prediction Report", ln=1)
-        pdf.set_font("Arial", size=11)
-        for k in ["_row","cluster","predicted_yield","latitude","longitude","sown_area","year"]:
-            if k in r and r[k] is not None and not (isinstance(r[k], float) and np.isnan(r[k])):
-                pdf.multi_cell(0, 8, f"{k.replace('_',' ').title()}: {r[k]}")
-        if "_error" in r:
-            pdf.set_text_color(220,20,60); pdf.multi_cell(0,8,f"Error: {r['_error']}"); pdf.set_text_color(0,0,0)
-    out = io.BytesIO(); pdf.output(out); return out.getvalue()
+# ---------- insight generation ----------
+def _mean_of(cols: List[str], row: pd.Series) -> Optional[float]:
+    vals = [row.get(c) for c in cols if c in row.index and pd.notna(row.get(c))]
+    return float(np.mean(vals)) if vals else None
+
+def climate_fingerprint(row: pd.Series) -> Dict[str, str]:
+    # 取均值/简单阈值判别
+    t_cols = [c for c in row.index if "tmean" in c.lower()]
+    p_cols = [c for c in row.index if "precip" in c.lower()]
+    s_cols = [c for c in row.index if ("sun" in c.lower() or "rad" in c.lower())]
+    w_cols = [c for c in row.index if ("wind" in c.lower() or "ws" in c.lower())]
+    d_cols = [c for c in row.index if "dryness" in c.lower()]
+
+    t = _mean_of(t_cols, row); p = _mean_of(p_cols, row)
+    s = _mean_of(s_cols, row); w = _mean_of(w_cols, row); d = _mean_of(d_cols, row)
+
+    temp = "hot" if (t is not None and t >= 18) else ("cool" if (t is not None and t <= 8) else "mild")
+    moist = "dry" if ((d is not None and d >= 0.9) or (p is not None and p < 60)) else ("wet" if (p is not None and p > 180) else "normal")
+    sun   = "sunny" if (s is not None and s >= 220) else ("cloudy" if (s is not None and s <= 120) else "average")
+    wind  = "windy" if (w is not None and w >= 6) else ("calm" if (w is not None and w <= 2) else "breezy")
+
+    return {"temp": temp, "moist": moist, "sun": sun, "wind": wind}
+
+def insight_text(cluster: Optional[int], row: pd.Series, shap_df: pd.DataFrame) -> str:
+    fp = climate_fingerprint(row)
+    # SHAP：正/负驱动 TOP3
+    pos = shap_df.sort_values("shap", ascending=False)
+    neg = shap_df.sort_values("shap", ascending=True)
+    pos_names = [pos.iloc[i]["feature"] for i in range(min(3, len(pos))) if pos.iloc[i]["shap"] > 0]
+    neg_names = [neg.iloc[i]["feature"] for i in range(min(3, len(neg))) if neg.iloc[i]["shap"] < 0]
+
+    parts = []
+    if cluster is not None:
+        parts.append(f"Detected climate cluster: **{cluster}**.")
+    parts.append(f"Climate fingerprint suggests **{fp['temp']} & {fp['moist']}**, "
+                 f"{fp['sun']} radiation and {fp['wind']} conditions.")
+
+    if pos_names:
+        parts.append("Strong positive drivers: " + ", ".join(pos_names) + ".")
+    if neg_names:
+        parts.append("Limiting factors: " + ", ".join(neg_names) + ".")
+
+    # 建议
+    tips = []
+    if fp["moist"] == "dry":
+        tips += ["prioritize irrigation scheduling", "use drought-tolerant cultivars", "mulch/retain soil moisture"]
+    elif fp["moist"] == "wet":
+        tips += ["improve drainage after heavy rain", "tight disease scouting (rust/mildew)", "split nitrogen to avoid lodging"]
+    if fp["temp"] == "hot":
+        tips += ["avoid heat stress near heading/filling (irrigate earlier in the day)"]
+    elif fp["temp"] == "cool":
+        tips += ["watch for slow development; consider earlier-maturing varieties"]
+    if fp["wind"] == "windy":
+        tips += ["use lodging-resistant varieties or windbreaks"]
+    if fp["sun"] == "cloudy":
+        tips += ["increase seeding density slightly to compensate for low radiation"]
+
+    if tips:
+        parts.append("Suggested actions: " + "; ".join(tips) + ".")
+
+    return " ".join(parts)
 
 # ---------- UI ----------
 mode = st.sidebar.radio("Prediction Mode", ["Single prediction", "Batch prediction (CSV)"], index=0)
@@ -312,11 +347,25 @@ if mode == "Batch prediction (CSV)":
                 out_rows.append(rec)
             except Exception as e:
                 out_rows.append({"_row": i, "cluster": clu, "predicted_yield": np.nan, "_error": str(e)})
+
         res = pd.DataFrame(out_rows)
         st.dataframe(res)
         st.download_button("Download results CSV", res.to_csv(index=False).encode("utf-8"),
                            file_name="predictions.csv")
         try:
+            from fpdf import FPDF
+            def make_pdf_batch(rows: List[Dict[str, Any]]) -> bytes:
+                pdf = FPDF()
+                for r in rows:
+                    pdf.add_page(); pdf.set_font("Arial", size=14)
+                    pdf.cell(0, 10, "Wheat Yield Prediction Report", ln=1)
+                    pdf.set_font("Arial", size=11)
+                    for k in ["_row","cluster","predicted_yield","latitude","longitude","sown_area","year"]:
+                        if k in r and r[k] is not None and not (isinstance(r[k], float) and np.isnan(r[k])):
+                            pdf.multi_cell(0, 8, f"{k.replace('_',' ').title()}: {r[k]}")
+                    if "_error" in r:
+                        pdf.set_text_color(220,20,60); pdf.multi_cell(0,8,f"Error: {r['_error']}"); pdf.set_text_color(0,0,0)
+                out = io.BytesIO(); pdf.output(out); return out.getvalue()
             pdf_bytes = make_pdf_batch(out_rows)
             st.download_button("Download Reports PDF", data=pdf_bytes,
                                file_name="reports.pdf", mime="application/pdf")
@@ -386,9 +435,16 @@ else:
         try:
             yhat, feats, model = predict_yield(clu, row)
             st.markdown(f"### Predicted Yield: **{yhat:.3f} tons/ha**")
+
+            # SHAP & INSIGHT
             fig, shap_df = shap_single(row, feats, model, clu=clu)
             st.markdown("**SHAP explanation (Top-10 features):**")
             st.pyplot(fig)
+
+            insight = insight_text(clu, row.reindex(feats), shap_df)
+            st.markdown("**Insight**")
+            st.info(insight)
+
             st.download_button("Download SHAP CSV",
                                shap_df.to_csv(index=False).encode("utf-8"),
                                file_name="shap_top10.csv")
