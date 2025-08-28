@@ -3,3 +3,8 @@ pandas>=1.3.0
 numpy>=1.21.0
 scikit-learn>=1.0
 joblib>=1.1.0
+catboost
+streamlit
+pandas
+numpy
+scikit-learn
