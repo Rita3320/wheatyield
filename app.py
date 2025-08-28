@@ -3,12 +3,13 @@ import pandas as pd
 import numpy as np
 import time
 import joblib
-
+from catboost import CatBoostRegressor
+import json
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 # Load trained model and top feature list
-model = joblib.load("model_rf.pkl")
+model = joblib.load("cat_model.pkl")
 top_features = joblib.load("top_features.pkl")  # list of features used
 
 st.set_page_config(page_title="Wheat Yield Predictor", layout="centered")
