@@ -411,7 +411,8 @@ if mode == "Batch prediction (CSV)":
             st.download_button("Download Reports PDF", data=pdf_bytes,
                                file_name="reports.pdf", mime="application/pdf")
         except Exception as e:
-            st.info(str(e))
+            # 静默，不在页面提示
+            pass
 
 else:
     st.subheader("Single prediction")
@@ -494,7 +495,6 @@ else:
             # 单次 PDF 报告
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cluster_disp = f"Clustered (cluster={clu})" if regressors else "Global model"
-            # 取 Top SHAP 列表
             shap_sorted = shap_df.reindex(shap_df["shap"].abs().sort_values(ascending=False).index)
             top_items = list(zip(shap_sorted["feature"].tolist(), shap_sorted["shap"].tolist()))
             meta = {"year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area}
@@ -504,7 +504,8 @@ else:
                                    file_name=f"prediction_{ts.replace(':','-').replace(' ','_')}.pdf",
                                    mime="application/pdf")
             except Exception as e:
-                st.info(str(e))
+                # 静默，不在页面提示
+                pass
 
             # 历史记录（仅保存与当前模型相关的特征）
             rec = {
