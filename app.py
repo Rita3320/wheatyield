@@ -1,4 +1,9 @@
 # app.py — Wheat Yield Prediction (cluster-aware with flat-file fallback)
+# 变更：
+#   1) 输入改为：纬度/经度/海拔 + 每月(平均/最高/最低气温、降水、日照、风速) + sown_area_hectare
+#   2) 自动将月度数据聚合为模型所需的季节/农时特征（与你原先的特征名保持一致）
+#   3) 其它功能（聚类检测、PDF、历史记录、Batch）保持不变
+#   4) SHAP 图固定显示绝对值(|value|)；修复 Streamlit 小部件默认值冲突和 insight_text 报错
 
 import os, io, re, json, joblib, random, datetime
 import streamlit as st
@@ -175,7 +180,7 @@ def monthly_to_features(row: pd.Series) -> pd.Series:
     out["latitude"]      = row.get("latitude")
     out["longitude"]     = row.get("longitude")
     out["elevation_m"]   = row.get("elevation_m")
-    out["sown_area"]     = row.get("sown_area_hectare")  # PDF 用
+    out["sown_area"]     = row.get("sown_area_hectare")  # PDF 显示
     out["sown_area_hectare"] = row.get("sown_area_hectare")
     out["year"]          = row.get("year")
     return pd.Series(out, dtype="float64")
@@ -289,25 +294,38 @@ def climate_fingerprint(row_model_feats: pd.Series) -> Dict[str, str]:
     return {"temp": temp, "moist": moist, "sun": sun, "wind": wind}
 
 def insight_text(cluster: Optional[int], row_model_feats: pd.Series, shap_df: pd.DataFrame) -> str:
+    """生成可读的洞察文本；shap_df 需要包含列 ['feature', 'shap']（带符号的 SHAP）。"""
     fp = climate_fingerprint(row_model_feats)
-    pos = shap_df.sort_values("shap", ascending=False)
-    neg = shap_df.sort_values("shap", ascending=True)
-    pos_names = [pos.iloc[i]["feature"] for i in range(min(3, len(pos))) if pos.iloc[i]["shap"] > 0]
-    neg_names = [neg.iloc[i]["feature"] for i in range(min(3, len(neg))) if neg.iloc[i]["shap"] < 0]
+
+    # 取前3个正向/负向驱动特征名
+    pos_names = shap_df[shap_df["shap"] > 0].nlargest(3, "shap")["feature"].tolist()
+    neg_names = shap_df[shap_df["shap"] < 0].nsmallest(3, "shap")["feature"].tolist()
+
     parts = []
     if cluster is not None:
         parts.append(f"Detected climate cluster: {cluster}.")
     parts.append(f"Climate fingerprint: {fp['temp']} & {fp['moist']}, {fp['sun']} radiation, {fp['wind']} winds.")
-    if pos_names: parts.append("Positive drivers: " + ", ").join(pos_names)
-    if neg_names: parts.append("Limiting factors: " + ", ".join(neg_names) + ".")
+    if pos_names:
+        parts.append("Positive drivers: " + ", ".join(pos_names) + ".")
+    if neg_names:
+        parts.append("Limiting factors: " + ", ".join(neg_names) + ".")
+
     tips = []
-    if fp["moist"] == "dry": tips += ["prioritize irrigation scheduling", "retain soil moisture (mulch)"]
-    elif fp["moist"] == "wet": tips += ["improve drainage after rain", "tight disease scouting", "split nitrogen to avoid lodging"]
-    if fp["temp"] == "hot": tips += ["mitigate heat stress near heading/filling"]
-    elif fp["temp"] == "cool": tips += ["consider earlier-maturing varieties"]
-    if fp["wind"] == "windy": tips += ["use lodging-resistant varieties or windbreaks"]
-    if fp["sun"] == "cloudy": tips += ["slightly increase seeding density"]
-    if tips: parts.append("Suggested actions: " + "; ".join(tips) + ".")
+    if fp["moist"] == "dry":
+        tips += ["prioritize irrigation scheduling", "retain soil moisture (mulch)"]
+    elif fp["moist"] == "wet":
+        tips += ["improve drainage after rain", "tight disease scouting", "split nitrogen to avoid lodging"]
+    if fp["temp"] == "hot":
+        tips += ["mitigate heat stress near heading/filling"]
+    elif fp["temp"] == "cool":
+        tips += ["consider earlier-maturing varieties"]
+    if fp["wind"] == "windy":
+        tips += ["use lodging-resistant varieties or windbreaks"]
+    if fp["sun"] == "cloudy":
+        tips += ["slightly increase seeding density"]
+
+    if tips:
+        parts.append("Suggested actions: " + "; ".join(tips) + ".")
     return " ".join(parts)
 
 # ---------- single PDF ----------
@@ -503,7 +521,6 @@ else:
             fig = _plot_shap_bar_abs(feat_list, contrib, clu=clu)  # 固定 absolute SHAP
             st.markdown("**SHAP explanation (Top-10 features):**")
             st.pyplot(fig)
-            st.caption(f"Base={base_value:.4f} | Sum(SHAP)={float(np.sum(contrib)):.4f} | Base+Sum≈Pred")
 
             # 生成 shap_df（按 |SHAP| 排序，用于 Insight 与 PDF）
             order = np.argsort(np.abs(contrib))[::-1][:min(10, len(contrib))]
@@ -513,7 +530,6 @@ else:
                 "abs_shap": [float(abs(contrib[i])) for i in order]
             })
 
-            from copy import deepcopy
             insight = insight_text(clu, row_model_feats.reindex(feats), shap_df[["feature","shap"]])
             st.markdown("**Insight**")
             st.info(insight)
