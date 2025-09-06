@@ -1,11 +1,10 @@
 # app.py — Wheat Yield Prediction (cluster-aware with flat-file fallback)
-# 变更：
-#   1) 输入：纬度/经度/海拔 + 每月(平均/最高/最低气温、降水、日照、风速) + sown_area_hectare
-#   2) 自动聚合为模型用的季节/农时特征（sowing/overwinter/jointing/heading/filling + dryness + GDD/HDD/CDD）
-#   3) SHAP 图固定显示绝对值(|value|)，不提供开关
-#   4) Insight：英文，一句话“温度/降水/日照/风”摘要 + 可执行建议（阈值触发），不依赖 SHAP
-#   5) 修复：Streamlit 小部件默认值冲突
-#   6) 修复：Insight 使用完整聚合后的行（不再 reindex(feats)），避免信息丢失
+# Features:
+# - Monthly inputs -> agronomic features + monthly aliases for model compatibility
+# - Absolute SHAP bar chart (no toggle)
+# - English climate summary + actionable recommendations
+# - Cluster auto-detect (if classifier present)
+# - Single & Batch prediction, PDF report, session history
 
 import os, io, re, json, joblib, random, datetime
 import streamlit as st
@@ -30,12 +29,12 @@ def load_json_or_pkl(path: str):
         return json.load(open(path, "r", encoding="utf-8"))
     return joblib.load(path)
 
-# ---------- scan artifacts (支持根目录 & models/) ----------
+# ---------- scan artifacts ----------
 CWD = os.getcwd()
 MODELS_DIR = "models"
 REG_DIR = os.path.join(MODELS_DIR, "regressors")
 
-# 分类器（可选）
+# Classifier (optional)
 clf_model_path = find_first(["cluster_model.cbm", os.path.join(MODELS_DIR, "cluster_model.cbm")])
 clf_features_path = find_first(["cluster_features.json", os.path.join(MODELS_DIR, "cluster_features.json")])
 clf_cat_features_path = find_first(["cluster_cat_features.json", os.path.join(MODELS_DIR, "cluster_cat_features.json")])
@@ -51,7 +50,7 @@ if HAS_CLF:
         st.warning(f"Classifier found but failed to load: {e}")
         HAS_CLF = False
 
-# 分簇回归器
+# Per-cluster regressors
 def scan_cluster_regressors() -> Dict[int, Dict[str, Any]]:
     regs: Dict[int, Dict[str, Any]] = {}
     for d in [CWD, REG_DIR]:
@@ -81,7 +80,7 @@ def scan_cluster_regressors() -> Dict[int, Dict[str, Any]]:
 
 regressors = scan_cluster_regressors()
 
-# 全局回归器（退路）
+# Global regressor fallback
 GLOBAL_MODEL_PATH = find_first([
     "cat_model.pkl","cat_model.joblib","cat_model.cbm",
     os.path.join(MODELS_DIR,"cat_model.pkl"), os.path.join(MODELS_DIR,"cat_model.joblib"),
@@ -112,23 +111,22 @@ else:
 if HAS_CLF:
     st.caption("Cluster classifier available: Auto-detect enabled.")
 
-# ========== 月度输入 Schema ==========
-MONTHS = [f"{m:02d}" for m in range(1, 12+1)]
+# ========== monthly input schema ==========
+MONTHS = [f"{m:02d}" for m in range(1, 13)]
 COLS_MONTHLY = []
-for m in MONTHS:
+for MM in MONTHS:
     COLS_MONTHLY += [
-        f"tavg_{m}_C",     # 每月平均气温 (℃)
-        f"tmax_{m}_C",     # 每月最高气温 (℃)
-        f"tmin_{m}_C",     # 每月最低气温 (℃)
-        f"precip_{m}_mm",  # 每月降水量 (mm)
-        f"sunshine_{m}_h", # 每月日照时数 (h)
-        f"wind_{m}_ms",    # 每月平均风速 (m/s)
+        f"tavg_{MM}_C",     # mean T (°C)
+        f"tmax_{MM}_C",     # max T (°C)
+        f"tmin_{MM}_C",     # min T (°C)
+        f"precip_{MM}_mm",  # precip (mm)
+        f"sunshine_{MM}_h", # sunshine (h)
+        f"wind_{MM}_ms",    # wind (m/s)
     ]
-
 BASE_INPUTS = ["latitude", "longitude", "elevation_m", "sown_area_hectare", "year"]
 ALL_INPUT_COLS = BASE_INPUTS + COLS_MONTHLY
 
-# ========== 聚合：月度 -> 模型特征 ==========
+# ========== monthly -> model features ==========
 PHASES = {
     "sowing":      ["10", "11"],
     "overwinter":  ["12", "01", "02"],
@@ -147,15 +145,21 @@ def _safe_sum(vals):
     return float(np.sum(vals)) if vals else np.nan
 
 def monthly_to_features(row: pd.Series) -> pd.Series:
+    """
+    Aggregate monthly climate to agronomic phases and also emit monthly aliases
+    (tmean_k, tmean_MM, sun_k, wind_k/ws_k, precip_k) so models trained on
+    monthly names like 'tmean_9','sun_12','wind_8' can work out-of-the-box.
+    """
     out = {}
-    # 1) 农时聚合
+
+    # ---- phase aggregates ----
     for phase, months in PHASES.items():
         tavg = []; precip = []; sun = []; wind = []
-        for m in months:
-            tavg.append(row.get(f"tavg_{m}_C"))
-            precip.append(row.get(f"precip_{m}_mm"))
-            sun.append(row.get(f"sunshine_{m}_h"))
-            wind.append(row.get(f"wind_{m}_ms"))
+        for MM in months:
+            tavg.append(row.get(f"tavg_{MM}_C"))
+            precip.append(row.get(f"precip_{MM}_mm"))
+            sun.append(row.get(f"sunshine_{MM}_h"))
+            wind.append(row.get(f"wind_{MM}_ms"))
         out[f"{phase}TmeanAvg"]  = _safe_mean(tavg)
         out[f"{phase}PrecipSum"] = _safe_sum(precip)
         out[f"{phase}SunHours"]  = _safe_sum(sun)
@@ -166,28 +170,38 @@ def monthly_to_features(row: pd.Series) -> pd.Series:
             if (pd.notna(precip_sum) and pd.notna(tavg_mean)) else np.nan
         )
 
-    # 2) GDD/HDD/CDD（简化估算：按月≈30天）
-    def _deg_days_pos(x): return max(float(x), 0.0)
-    gdd5 = 0.0; hdd30 = 0.0; cdd0 = 0.0
-    for m in GROW_MONTHS:
-        tavg = row.get(f"tavg_{m}_C")
-        tmax = row.get(f"tmax_{m}_C")
-        tmin = row.get(f"tmin_{m}_C")
-        if pd.notna(tavg): gdd5 += _deg_days_pos(tavg - 5.0) * 30.0
-        if pd.notna(tmax): hdd30 += _deg_days_pos(tmax - 30.0) * 30.0
-        if pd.notna(tmin): cdd0  += _deg_days_pos(0.0 - tmin) * 30.0
-    out["gddBase5"] = gdd5; out["hddGt30"] = hdd30; out["cddLt0"] = cdd0
+    # ---- monthly aliases to match trained feature names ----
+    for idx, MM in enumerate(MONTHS, start=1):
+        m = str(idx)  # 1..12 without leading zero
+        # temp mean
+        v_t = row.get(f"tavg_{MM}_C")
+        out[f"tmean_{m}"]  = v_t
+        out[f"tmean_{MM}"] = v_t
+        # precip
+        v_p = row.get(f"precip_{MM}_mm")
+        out[f"precip_{m}"]  = v_p
+        out[f"precip_{MM}"] = v_p
+        # sunshine
+        v_s = row.get(f"sunshine_{MM}_h")
+        out[f"sun_{m}"]  = v_s
+        out[f"sun_{MM}"] = v_s
+        # wind
+        v_w = row.get(f"wind_{MM}_ms")
+        out[f"wind_{m}"]  = v_w
+        out[f"wind_{MM}"] = v_w
+        out[f"ws_{m}"]    = v_w
+        out[f"ws_{MM}"]   = v_w
 
-    # 3) 地理/背景
-    out["latitude"]      = row.get("latitude")
-    out["longitude"]     = row.get("longitude")
-    out["elevation_m"]   = row.get("elevation_m")
-    out["sown_area"]     = row.get("sown_area_hectare")  # PDF 显示
-    out["sown_area_hectare"] = row.get("sown_area_hectare")
-    out["year"]          = row.get("year")
+    # ---- background ----
+    out["latitude"]            = row.get("latitude")
+    out["longitude"]           = row.get("longitude")
+    out["elevation_m"]         = row.get("elevation_m")
+    out["sown_area"]           = row.get("sown_area_hectare")  # for PDF
+    out["sown_area_hectare"]   = row.get("sown_area_hectare")
+    out["year"]                = row.get("year")
     return pd.Series(out, dtype="float64")
 
-# ---------- Random generators ----------
+# ---------- random generators ----------
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -202,32 +216,29 @@ def autofill_monthly_by_lat_elev(lat: float, elev: float, seed: Optional[int] = 
     lat_abs = abs(lat)
     base = 23.0 - 0.25*lat_abs - 6.5*(elev/1000.0)
     amp  = 12.0
-    for i, m in enumerate(MONTHS, start=1):
-        tavg = _sin_annual(i, amp, base) + np.random.normal(0, 1.0)
-        tmax = tavg + 6 + np.random.normal(0, 0.8)
-        tmin = tavg - 6 + np.random.normal(0, 0.8)
+    for i, MM in enumerate(MONTHS, start=1):
+        tavg = _sin_annual(i, amp, base) + np.random.normal(0, 1.1)
+        tmax = tavg + 6 + np.random.normal(0, 0.9)
+        tmin = tavg - 6 + np.random.normal(0, 0.9)
         precip   = max(0.0, (8 + 4*np.sin((i-1)/12*2*np.pi)) * (random.uniform(5, 20)))
-        sunshine = max(0.0, 150 + 80*np.sin((i-1)/12*2*np.pi) + np.random.normal(0, 10))
-        wind     = _clamp(random.uniform(2.0, 6.0) + np.random.normal(0, 0.5), 0.0, 30.0)
-        out[f"tavg_{m}_C"]     = round(float(tavg), 1)
-        out[f"tmax_{m}_C"]     = round(float(tmax), 1)
-        out[f"tmin_{m}_C"]     = round(float(tmin), 1)
-        out[f"precip_{m}_mm"]  = round(float(precip), 1)
-        out[f"sunshine_{m}_h"] = round(float(sunshine), 1)
-        out[f"wind_{m}_ms"]    = round(float(wind), 1)
+        sunshine = max(0.0, 150 + 80*np.sin((i-1)/12*2*np.pi) + np.random.normal(0, 12))
+        wind     = _clamp(random.uniform(2.0, 6.0) + np.random.normal(0, 0.6), 0.0, 30.0)
+        out[f"tavg_{MM}_C"]     = round(float(tavg), 1)
+        out[f"tmax_{MM}_C"]     = round(float(tmax), 1)
+        out[f"tmin_{MM}_C"]     = round(float(tmin), 1)
+        out[f"precip_{MM}_mm"]  = round(float(precip), 1)
+        out[f"sunshine_{MM}_h"] = round(float(sunshine), 1)
+        out[f"wind_{MM}_ms"]    = round(float(wind), 1)
     return out
 
 # ---------- SHAP ----------
-def shap_single(row_model_feats: pd.Series, feats: List[str], model: Any, clu: Optional[int]=None) -> Tuple[np.ndarray, List[str], float]:
-    """返回 (contrib, feats, base_value)。"""
+def shap_single(row_model_feats: pd.Series, feats: List[str], model: Any, clu: Optional[int]=None) -> Tuple[np.ndarray, List[str]]:
     X = row_model_feats.reindex(feats).fillna(row_model_feats.reindex(feats).dropna().median())
     df1 = pd.DataFrame([X], columns=feats)
-    base_value = 0.0
     try:
         if isinstance(model, CatBoostRegressor):
             sv = model.get_feature_importance(type="ShapValues", data=Pool(df1))
             contrib = sv[0, :-1]
-            base_value = float(sv[0, -1])
         else:
             raise TypeError("not catboost")
     except Exception:
@@ -236,11 +247,9 @@ def shap_single(row_model_feats: pd.Series, feats: List[str], model: Any, clu: O
         expl = shap.KernelExplainer(f, df1)
         vals = expl.shap_values(df1, nsamples=min(100, 2*len(feats)))
         contrib = np.array(vals)[0]
-        base_value = float(model.predict(df1)[0] - contrib.sum())
-    return np.array(contrib, dtype=float), feats, base_value
+    return np.array(contrib, dtype=float), feats
 
-def _plot_shap_bar_abs(feats: List[str], contrib: np.ndarray, clu: Optional[int]):
-    """水平条形图（固定按 |SHAP| 绘图）。"""
+def plot_shap_bar_abs(feats: List[str], contrib: np.ndarray, clu: Optional[int]):
     order = np.argsort(np.abs(contrib))[::-1][:min(10, len(contrib))]
     names = [feats[i] for i in order][::-1]
     vplot = [float(abs(contrib[i])) for i in order][::-1]
@@ -276,14 +285,8 @@ def predict_yield(clu: Optional[int], row_model_feats: pd.Series) -> Tuple[float
     yhat = float(model.predict(pd.DataFrame([X], columns=feats))[0])
     return yhat, feats, model
 
-# ---------- insight generation（英文摘要+建议） ----------
+# ---------- insight (EN: summary + actionable tips) ----------
 def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> str:
-    """
-    English Insight:
-    - One-sentence climate summary using only temperature / precipitation / sunshine / wind.
-    - Then actionable, stage-specific tips triggered by thresholds.
-    - No cluster mention, no SHAP dependence.
-    """
     def gv(name):
         v = row_model_feats.get(name)
         return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
@@ -295,11 +298,7 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
     head_t  = gv("headingTmeanAvg");     head_p  = gv("headingPrecipSum");   head_s = gv("headingSunHours"); head_w = gv("headingWindAvg")
     fill_t  = gv("fillingTmeanAvg");     fill_p  = gv("fillingPrecipSum");   fill_s = gv("fillingSunHours"); fill_w = gv("fillingWindAvg")
 
-    # Dryness & thermal stress (tips only)
-    d_joint = gv("drynessJointing"); d_head = gv("drynessHeading"); d_fill = gv("drynessFilling")
-    gdd = gv("gddBase5"); hdd = gv("hddGt30"); cdd = gv("cddLt0")
-
-    # Season rollups (for summary)
+    # rollups for summary
     temp_pool = [x for x in [sow_t, over_t, joint_t, head_t, fill_t] if x is not None]
     season_t = float(np.mean(temp_pool)) if temp_pool else None
     precip_pool = [p for p in [sow_p, joint_p, head_p, fill_p] if p is not None]
@@ -309,68 +308,74 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
     wind_pool = [w for w in [head_w, fill_w] if w is not None]
     season_w = float(np.mean(wind_pool)) if wind_pool else None
 
-    # Bucketing to words
-    def bucket_temp(t):
+    # buckets
+    def b_temp(t):
         if t is None: return "typical temperatures"
         if t < 5:   return "very cool conditions"
         if t < 10:  return "cool conditions"
         if t < 18:  return "mild conditions"
         if t < 24:  return "warm conditions"
         return "hot conditions"
-    def bucket_rain(p):
+    def b_rain(p):
         if p is None: return "typical rainfall"
         if p < 300:  return "dry rainfall"
         if p <= 700: return "moderate rainfall"
         return "wet rainfall"
-    def bucket_sun(s):
+    def b_sun(s):
         if s is None: return "average sunshine"
         if s < 350:  return "limited sunshine"
         if s <= 650: return "average sunshine"
         return "plentiful sunshine"
-    def bucket_wind(w):
+    def b_wind(w):
         if w is None: return "light winds"
         if w < 2:    return "calm winds"
         if w <= 6:   return "breezy winds"
         return "windy conditions"
 
-    summary = (
-        f"Overall, {bucket_temp(season_t)} and {bucket_rain(season_p)}; "
-        f"{bucket_sun(season_s)} with {bucket_wind(season_w)}."
-    )
+    summary = f"Overall, {b_temp(season_t)} and {b_rain(season_p)}; {b_sun(season_s)} with {b_wind(season_w)}."
 
-    # Recommendations
+    # actionable tips (threshold triggers)
     tips: List[str] = []
-    if any(d is not None and d >= 0.9 for d in [d_joint, d_head, d_fill]) \
-       or (head_p is not None and head_p < 40) or (fill_p is not None and fill_p < 40):
+    # moisture: dryness or low precip near sensitive stages
+    dryness_joint = (joint_p is not None and joint_p < 40)
+    dryness_head  = (head_p  is not None and head_p  < 40)
+    dryness_fill  = (fill_p  is not None and fill_p  < 40)
+    if dryness_joint or dryness_head or dryness_fill:
         tips += [
             "During jointing–grain filling, schedule light but frequent irrigations (every 5–7 days).",
             "After sowing, roll lightly or keep residue mulch to conserve moisture."
         ]
+    # excess rain
     if any(p is not None and p > 180 for p in [joint_p, head_p, fill_p]):
         tips += [
             "After heavy rain, open drainage furrows promptly, especially in low-lying fields.",
             "Scout closely for diseases around heading (e.g., Fusarium head blight) and treat in time."
         ]
-    if (over_t is not None and over_t < 0) or (cdd is not None and cdd > 150):
+    # winter cold risk
+    if (over_t is not None and over_t < 0):
         tips += [
             "Monitor cold snaps; implement cold-protection where feasible.",
             "Split N before winter to avoid lush growth and reduce freeze injury."
         ]
-    if (hdd is not None and hdd > 120) or (head_t is not None and head_t > 26) or (fill_t is not None and fill_t > 24):
+    # heat stress
+    if (head_t is not None and head_t > 26) or (fill_t is not None and fill_t > 24):
         tips += [
             "Ahead of heat waves at heading–filling, irrigate 1–2 days earlier to lower canopy temperature.",
             "Prefer heat-tolerant, lodging-resistant cultivars; consider mild growth regulation at jointing if overly lush."
         ]
-    if ((head_w is not None and head_w > 6) or (fill_w is not None and fill_w > 6)) \
-       and ((head_p is not None and head_p > 120) or (fill_p is not None and fill_p > 120)):
+    # lodging: wind + rain
+    if ((head_w is not None and head_w > 6) or (fill_w is not None and fill_w > 6)) and \
+       ((head_p is not None and head_p > 120) or (fill_p is not None and fill_p > 120)):
         tips += [
             "Cap nitrogen after jointing and consider growth regulators; set windbreaks or temporary staking.",
             "Drain excess water quickly after storms."
         ]
+    # sowing window / stand
     if sow_t is not None and sow_t > 18:
         tips += ["At sowing under warm conditions, consider slightly earlier sowing or drought-tolerant cultivars; roll after sowing to retain moisture."]
     elif sow_t is not None and sow_t < 5:
         tips += ["Under cool sowing conditions, delay sowing or raise seeding rate by ~10–15% to secure establishment."]
+    # low sunshine
     if (over_s is not None and over_s < 100) or (head_s is not None and head_s < 140) or (fill_s is not None and fill_s < 140):
         tips += ["With limited sunshine, slightly increase plant density and enhance disease surveillance; avoid excessive nitrogen that promotes lodging."]
     if not tips:
@@ -380,7 +385,7 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
     md += [f"- {t}" for t in list(dict.fromkeys(tips))]
     return "\n".join(md)
 
-# ---------- single PDF ----------
+# ---------- PDF ----------
 def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
                     meta: Dict[str, Any], top_items: List[Tuple[str, float]], insight: str) -> bytes:
     try:
@@ -421,16 +426,16 @@ def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
     out = io.BytesIO(); pdf.output(out)
     return out.getvalue()
 
-# ---------- history store ----------
+# ---------- history ----------
 if "history" not in st.session_state:
-    st.session_state["history"] = []  # list of dicts
+    st.session_state["history"] = []
 
 # ---------- UI ----------
 mode = st.sidebar.radio("Prediction Mode", ["Single prediction", "Batch prediction (CSV)"], index=0)
 
 if mode == "Batch prediction (CSV)":
     st.subheader("Batch prediction")
-    st.markdown("**CSV 需要包含以下列：**")
+    st.markdown("**CSV must contain these columns:**")
     st.code(", ".join(ALL_INPUT_COLS))
 
     up = st.file_uploader("Upload CSV", type=["csv"])
@@ -460,7 +465,7 @@ if mode == "Batch prediction (CSV)":
         st.download_button("Download results CSV", res.to_csv(index=False).encode("utf-8"),
                            file_name="predictions.csv")
 
-        # 批量PDF
+        # Batch PDF
         try:
             from fpdf import FPDF
             def make_pdf_batch(rows: List[Dict[str, Any]]) -> bytes:
@@ -484,7 +489,7 @@ if mode == "Batch prediction (CSV)":
 else:
     st.subheader("Single prediction")
 
-    # ---- 基本信息 ----
+    # ---- basics ----
     c1, c2 = st.columns(2)
     with c1:
         year = st.number_input("Year", min_value=1900, max_value=2100, value=2018, step=1, key="in_year")
@@ -494,7 +499,7 @@ else:
         longitude = st.number_input("Longitude (°)", min_value=-180.0, max_value=180.0, value=113.62, step=0.01, format="%.2f", key="in_lon")
     elevation_m = st.number_input("Elevation (m)", min_value=-500.0, max_value=9000.0, value=50.0, step=1.0, format="%.1f", key="in_elev")
 
-    # ---- 自动填充 ----
+    # ---- autofill ----
     st.markdown("**Auto-fill tools**")
     cc1, cc2 = st.columns([1,2])
     with cc2:
@@ -506,52 +511,52 @@ else:
             for k, v in auto.items():
                 st.session_state[f"in_{k}"] = v
 
-    # ---- 初始化月度默认（防止小部件告警）----
+    # ---- init monthly defaults (avoid widget warning) ----
     def init_monthly_defaults():
-        for m in MONTHS:
-            st.session_state.setdefault(f"in_tavg_{m}_C", 10.0)
-            st.session_state.setdefault(f"in_tmax_{m}_C", 15.0)
-            st.session_state.setdefault(f"in_tmin_{m}_C", 5.0)
-            st.session_state.setdefault(f"in_precip_{m}_mm", 50.0)
-            st.session_state.setdefault(f"in_sunshine_{m}_h", 160.0)
-            st.session_state.setdefault(f"in_wind_{m}_ms", 3.5)
+        for MM in MONTHS:
+            st.session_state.setdefault(f"in_tavg_{MM}_C", 10.0)
+            st.session_state.setdefault(f"in_tmax_{MM}_C", 15.0)
+            st.session_state.setdefault(f"in_tmin_{MM}_C", 5.0)
+            st.session_state.setdefault(f"in_precip_{MM}_mm", 50.0)
+            st.session_state.setdefault(f"in_sunshine_{MM}_h", 160.0)
+            st.session_state.setdefault(f"in_wind_{MM}_ms", 3.5)
     init_monthly_defaults()
 
-    # ---- 月度输入网格（只用 key，不传 value）----
+    # ---- monthly inputs grid ----
     st.markdown("**Monthly climate inputs**")
     for row_start in range(0, 12, 3):
         cols = st.columns(3)
-        for j, m in enumerate(MONTHS[row_start:row_start+3]):
+        for j, MM in enumerate(MONTHS[row_start:row_start+3]):
             with cols[j]:
-                st.markdown(f"**Month {m}**")
-                st.number_input(f"tavg_{m}_C (°C)", key=f"in_tavg_{m}_C",
+                st.markdown(f"**Month {MM}**")
+                st.number_input(f"tavg_{MM}_C (°C)", key=f"in_tavg_{MM}_C",
                                 min_value=-50.0, max_value=60.0, step=0.1, format="%.1f")
-                st.number_input(f"tmax_{m}_C (°C)", key=f"in_tmax_{m}_C",
+                st.number_input(f"tmax_{MM}_C (°C)", key=f"in_tmax_{MM}_C",
                                 min_value=-50.0, max_value=70.0, step=0.1, format="%.1f")
-                st.number_input(f"tmin_{m}_C (°C)", key=f"in_tmin_{m}_C",
+                st.number_input(f"tmin_{MM}_C (°C)", key=f"in_tmin_{MM}_C",
                                 min_value=-70.0, max_value=50.0, step=0.1, format="%.1f")
-                st.number_input(f"precip_{m}_mm (mm)", key=f"in_precip_{m}_mm",
+                st.number_input(f"precip_{MM}_mm (mm)", key=f"in_precip_{MM}_mm",
                                 min_value=0.0, max_value=1000.0, step=0.1, format="%.1f")
-                st.number_input(f"sunshine_{m}_h (h)", key=f"in_sunshine_{m}_h",
+                st.number_input(f"sunshine_{MM}_h (h)", key=f"in_sunshine_{MM}_h",
                                 min_value=0.0, max_value=744.0, step=0.1, format="%.1f")
-                st.number_input(f"wind_{m}_ms (m/s)", key=f"in_wind_{m}_ms",
+                st.number_input(f"wind_{MM}_ms (m/s)", key=f"in_wind_{MM}_ms",
                                 min_value=0.0, max_value=60.0, step=0.1, format="%.1f")
 
-    # ---- 组装一行（月度 -> 模型特征）----
+    # ---- assemble row & aggregate ----
     raw_monthly = {
         "latitude": latitude, "longitude": longitude, "elevation_m": elevation_m,
         "sown_area_hectare": sown_area_hectare, "year": year
     }
-    for m in MONTHS:
+    for MM in MONTHS:
         for k in ["tavg","tmax","tmin"]:
-            raw_monthly[f"{k}_{m}_C"] = float(st.session_state.get(f"in_{k}_{m}_C", np.nan))
-        raw_monthly[f"precip_{m}_mm"]  = float(st.session_state.get(f"in_precip_{m}_mm", np.nan))
-        raw_monthly[f"sunshine_{m}_h"] = float(st.session_state.get(f"in_sunshine_{m}_h", np.nan))
-        raw_monthly[f"wind_{m}_ms"]    = float(st.session_state.get(f"in_wind_{m}_ms", np.nan))
+            raw_monthly[f"{k}_{MM}_C"] = float(st.session_state.get(f"in_{k}_{MM}_C", np.nan))
+        raw_monthly[f"precip_{MM}_mm"]  = float(st.session_state.get(f"in_precip_{MM}_mm", np.nan))
+        raw_monthly[f"sunshine_{MM}_h"] = float(st.session_state.get(f"in_sunshine_{MM}_h", np.nan))
+        raw_monthly[f"wind_{MM}_ms"]    = float(st.session_state.get(f"in_wind_{MM}_ms", np.nan))
     row_monthly = pd.Series(raw_monthly, dtype="float64")
     row_model_feats = monthly_to_features(row_monthly)
 
-    # ---- 聚类选择/检测 ----
+    # ---- cluster selection/detection ----
     clu = None
     if regressors:
         if HAS_CLF:
@@ -563,26 +568,25 @@ else:
         else:
             clu = st.selectbox("Select cluster", sorted(regressors.keys()))
 
-    # ---- 预测 ----
+    # ---- predict ----
     if st.button("Predict"):
         try:
             yhat, feats, model = predict_yield(clu, row_model_feats)
             st.markdown(f"### Predicted Yield: **{yhat:.3f} tons/ha**")
 
-            contrib, feat_list, _ = shap_single(row_model_feats, feats, model, clu=clu)
-            fig = _plot_shap_bar_abs(feat_list, contrib, clu=clu)  # 固定 absolute SHAP
+            contrib, feat_list = shap_single(row_model_feats, feats, model, clu=clu)
+            fig = plot_shap_bar_abs(feat_list, contrib, clu=clu)
             st.markdown("**SHAP explanation (Top-10 features):**")
             st.pyplot(fig)
 
-            # |SHAP| 排序（PDF 用）；Insight 不依赖 SHAP
             order = np.argsort(np.abs(contrib))[::-1][:min(10, len(contrib))]
             shap_df = pd.DataFrame({
                 "feature": [feat_list[i] for i in order],
-                "shap": [float(contrib[i]) for i in order],
-                "abs_shap": [float(abs(contrib[i])) for i in order]
+                "abs_shap": [float(abs(contrib[i])) for i in order],
+                "shap": [float(contrib[i])) for i in order]
             })
 
-            # ====== 关键修复：Insight 用完整聚合行，不再 reindex(feats) ======
+            # Insight uses FULL aggregated row (no reindex), so it sees all climate values
             insight = insight_text(clu, row_model_feats)
             st.markdown("**Climate summary & recommendations**")
             st.info(insight)
@@ -590,8 +594,7 @@ else:
             # PDF
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cluster_disp = f"Clustered (cluster={clu})" if regressors else "Global model"
-            shap_sorted = shap_df.sort_values("abs_shap", ascending=False)
-            top_items = list(zip(shap_sorted["feature"].tolist(), shap_sorted["shap"].tolist()))
+            top_items = list(zip(shap_df["feature"].tolist(), shap_df["shap"].tolist()))
             meta = {"year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area_hectare}
             try:
                 pdf_bytes = make_pdf_single(ts, yhat, cluster_disp, meta, top_items, insight)
@@ -601,7 +604,7 @@ else:
             except Exception:
                 pass
 
-            # 历史记录
+            # history
             rec = {
                 "timestamp": ts,
                 "model_type": "clustered" if regressors else "global",
@@ -617,7 +620,7 @@ else:
         except Exception as e:
             st.error(str(e))
 
-    # ---- 历史记录 ----
+    # ---- history ----
     st.markdown("---")
     st.subheader("Prediction history (this session)")
     if st.session_state["history"]:
