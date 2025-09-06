@@ -1,7 +1,8 @@
 # app.py — Wheat Yield Prediction (cluster-aware with flat-file fallback)
-# 新增：
-#   - 单次预测 PDF 报告下载
-#   - 历史预测记录（会话内持久）并支持下载 CSV
+# 变更：
+#   1) 输入改为：纬度/经度/海拔 + 每月(平均/最高/最低气温、降水、日照、风速) + sown_area_hectare
+#   2) 自动将月度数据聚合为模型所需的季节/农时特征（与你原先的特征名保持一致）
+#   3) 其它功能（聚类检测、SHAP、PDF、历史记录、Batch）保持不变
 
 import os, io, re, json, joblib, zipfile, tempfile, random, datetime
 import streamlit as st
@@ -109,115 +110,135 @@ else:
 if HAS_CLF:
     st.caption("Cluster classifier available: Auto-detect enabled.")
 
-# ---------- UI feature list ----------
-COMMON_WEATHER = [
-    "sowingTmeanAvg","sowingPrecipSum","sowingSunHours","sowingWindAvg",
-    "overwinterTmeanAvg","overwinterPrecipSum","overwinterSunHours","overwinterWindAvg",
-    "jointingTmeanAvg","jointingPrecipSum","jointingSunHours","jointingWindAvg",
-    "headingTmeanAvg","headingPrecipSum","headingSunHours","headingWindAvg",
-    "fillingTmeanAvg","fillingPrecipSum","fillingSunHours","fillingWindAvg",
-    "drynessJointing","drynessHeading","drynessFilling","gddBase5","hddGt30","cddLt0",
-]
-if regressors:
-    all_reg_feats = sorted(set(sum([v["features"] for v in regressors.values()], [])))
-else:
-    all_reg_feats = list(global_regressor["features"])
-DISPLAY_FEATURES = list(dict.fromkeys(COMMON_WEATHER + all_reg_feats))
+# ========== 新的：月度输入 Schema ==========
+MONTHS = [f"{m:02d}" for m in range(1, 12+1)]
+COLS_MONTHLY = []
+for m in MONTHS:
+    COLS_MONTHLY += [
+        f"tavg_{m}_C",     # 每月平均气温 (℃)
+        f"tmax_{m}_C",     # 每月最高气温 (℃)
+        f"tmin_{m}_C",     # 每月最低气温 (℃)
+        f"precip_{m}_mm",  # 每月降水量 (mm)
+        f"sunshine_{m}_h", # 每月日照时数 (h)
+        f"wind_{m}_ms",    # 每月平均风速 (m/s)
+    ]
 
-def label_with_unit(col: str) -> str:
-    lc = col.lower()
-    if "tmean" in lc: u="[°C]"
-    elif "precip" in lc: u="[mm]"
-    elif ("sun" in lc) or ("rad" in lc): u="[hr]"
-    elif ("wind" in lc) or ("ws" in lc): u="[m/s]"
-    elif any(k in lc for k in ["gdd","hdd","cdd"]): u="[°C-days]"
-    elif "dryness" in lc: u="[ratio]"
-    else: u=""
-    return f"{col} {u}".strip()
+BASE_INPUTS = ["latitude", "longitude", "elevation_m", "sown_area_hectare", "year"]
+ALL_INPUT_COLS = BASE_INPUTS + COLS_MONTHLY
 
-def group_features(cols: List[str]) -> Dict[str, List[str]]:
-    def has(s,k): return k in s.lower()
-    g = {
-        "Sowing Phase":      [c for c in cols if has(c,"sowing")],
-        "Overwinter Phase":  [c for c in cols if has(c,"overwinter")],
-        "Jointing Phase":    [c for c in cols if has(c,"jointing")],
-        "Heading Phase":     [c for c in cols if has(c,"heading")],
-        "Filling Phase":     [c for c in cols if has(c,"filling")],
-        "Dryness Indices":   [c for c in cols if has(c,"dryness")],
-        "Extreme Indicators":[c for c in cols if any(t in c.lower() for t in ["gdd","hdd","cdd"])],
-        "Other Features":    [c for c in cols if not any(t in c.lower() for t in
-                                  ["sowing","overwinter","jointing","heading","filling","dryness","gdd","hdd","cdd"])],
-    }
-    return {k:v for k,v in g.items() if v}
+# ========== 聚合：月度 -> 模型特征 ==========
+# 冬小麦（北半球）一个常用分期（可根据数据再调）：
+PHASES = {
+    "sowing":      ["10", "11"],
+    "overwinter":  ["12", "01", "02"],
+    "jointing":    ["03", "04"],
+    "heading":     ["05"],
+    "filling":     ["06"],
+}
+# 生长季（用于GDD/HDD/CDD简化汇总）：10月 -> 次年6月
+GROW_MONTHS = ["10","11","12","01","02","03","04","05","06"]
+
+def _safe_mean(vals):
+    vals = [v for v in vals if pd.notna(v)]
+    return float(np.mean(vals)) if vals else np.nan
+
+def _safe_sum(vals):
+    vals = [v for v in vals if pd.notna(v)]
+    return float(np.sum(vals)) if vals else np.nan
+
+def monthly_to_features(row: pd.Series) -> pd.Series:
+    """将月度输入聚合为模型曾使用的季节/农时特征 + 一些极端/积温指标，特征名沿用原约定。"""
+    out = {}
+
+    # 1) 各农时平均/累计（气温用tavg，降水/日照求和，风速取平均）
+    for phase, months in PHASES.items():
+        tavg = []; precip = []; sun = []; wind = []
+        for m in months:
+            tavg.append(row.get(f"tavg_{m}_C"))
+            precip.append(row.get(f"precip_{m}_mm"))
+            sun.append(row.get(f"sunshine_{m}_h"))
+            wind.append(row.get(f"wind_{m}_ms"))
+        out[f"{phase}TmeanAvg"]     = _safe_mean(tavg)
+        out[f"{phase}PrecipSum"]    = _safe_sum(precip)
+        out[f"{phase}SunHours"]     = _safe_sum(sun)
+        out[f"{phase}WindAvg"]      = _safe_mean(wind)
+
+        # 简易干旱指数（precip / (tavg+10)）——与你之前代码里“ratio”语感保持一致
+        tavg_mean = out[f"{phase}TmeanAvg"]
+        precip_sum = out[f"{phase}PrecipSum"]
+        out[f"dryness{phase.capitalize()}"] = (
+            float(precip_sum) / (float(tavg_mean) + 10.0)
+            if (pd.notna(precip_sum) and pd.notna(tavg_mean)) else np.nan
+        )
+
+    # 2) GDD/HDD/CDD（简化估算：按月当30天，用月均/极值近似日尺度）
+    def _deg_days_pos(x): return max(float(x), 0.0)
+    gdd5 = 0.0; hdd30 = 0.0; cdd0 = 0.0
+    for m in GROW_MONTHS:
+        tavg = row.get(f"tavg_{m}_C")
+        tmax = row.get(f"tmax_{m}_C")
+        tmin = row.get(f"tmin_{m}_C")
+        if pd.notna(tavg):
+            gdd5 += _deg_days_pos(tavg - 5.0) * 30.0
+        if pd.notna(tmax):
+            hdd30 += _deg_days_pos(tmax - 30.0) * 30.0
+        if pd.notna(tmin):
+            cdd0  += _deg_days_pos(0.0 - tmin) * 30.0
+    out["gddBase5"] = gdd5
+    out["hddGt30"]  = hdd30
+    out["cddLt0"]   = cdd0
+
+    # 3) 地理/背景
+    out["latitude"]      = row.get("latitude")
+    out["longitude"]     = row.get("longitude")
+    out["elevation_m"]   = row.get("elevation_m")
+    out["sown_area"]     = row.get("sown_area_hectare")  # 你原PDF里显示用的是 sown_area
+    out["sown_area_hectare"] = row.get("sown_area_hectare")
+    out["year"]          = row.get("year")
+
+    return pd.Series(out, dtype="float64")
 
 # ---------- Random generators ----------
-def _rand(a: float, b: float) -> float:
-    return random.uniform(a, b)
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-RANGE = {
-    "tmean":   (-30.0, 45.0),
-    "precip":  (0.0,   500.0),
-    "sun":     (0.0,   400.0),
-    "wind":    (0.0,   30.0),
-    "dryness": (0.0,   2.0),
-    "gdd":     (0.0,   1500.0),
-    "hdd":     (0.0,   300.0),
-    "cdd":     (0.0,   500.0),
-}
+def _sin_annual(month_idx: int, amp: float, base: float) -> float:
+    # 简单年周期：1-12 -> 0..2π，冬低夏高（北半球）
+    x = (month_idx-1)/12.0 * 2*np.pi
+    return base + amp * np.sin(x - np.pi/2)
 
-def random_value_for_feature(name: str, profile: str = "random") -> float:
-    lc = name.lower()
-    if "tmean" in lc:
-        if "overwinter" in lc: base = _rand(-10, 8)
-        elif "filling" in lc or "heading" in lc: base = _rand(15, 28)
-        else: base = _rand(5, 25)
-        lo, hi = RANGE["tmean"]
-    elif "precip" in lc:
-        if "overwinter" in lc: base = _rand(5, 120)
-        else: base = _rand(10, 200)
-        lo, hi = RANGE["precip"]
-    elif ("sun" in lc) or ("rad" in lc):
-        if "overwinter" in lc: base = _rand(30, 180)
-        else: base = _rand(120, 320)
-        lo, hi = RANGE["sun"]
-    elif ("wind" in lc) or ("ws" in lc):
-        base = _rand(0.5, 8.0); lo, hi = RANGE["wind"]
-    elif "dryness" in lc:
-        base = _rand(0.2, 1.2); lo, hi = RANGE["dryness"]
-    elif "gdd" in lc:
-        base = _rand(100, 900); lo, hi = RANGE["gdd"]
-    elif "hdd" in lc:
-        base = _rand(0, 120); lo, hi = RANGE["hdd"]
-    elif "cdd" in lc:
-        base = _rand(10, 300); lo, hi = RANGE["cdd"]
-    else:
-        base = 0.0; lo, hi = 0.0, 1e9
-    if profile == "hot_dry":
-        if "tmean" in lc: base += 5
-        if "precip" in lc: base *= 0.55
-        if "sun" in lc: base += 40
-        if "dryness" in lc: base += 0.3
-        if "gdd" in lc: base *= 1.2
-    elif profile == "cool_wet":
-        if "tmean" in lc: base -= 5
-        if "precip" in lc: base *= 1.4
-        if "sun" in lc: base -= 40
-        if "dryness" in lc: base -= 0.2
-        if "gdd" in lc: base *= 0.85
-    return _clamp(float(base), lo, hi)
-
-def apply_random_to_session(features: List[str], profile: str = "random", seed: Optional[int] = None):
+def autofill_monthly_by_lat_elev(lat: float, elev: float, seed: Optional[int] = None) -> Dict[str, float]:
+    """给月度输入一个合理的自动填充（随纬度和海拔粗略变化）"""
     if seed is not None:
         random.seed(int(seed)); np.random.seed(int(seed))
-    for c in features:
-        st.session_state[f"in_{c}"] = round(random_value_for_feature(c, profile), 2)
+    out = {}
+    # 气温基准：低纬更暖；海拔每上升1000m降温约6.5℃
+    lat_abs = abs(lat)
+    base = 23.0 - 0.25*lat_abs - 6.5*(elev/1000.0)
+    amp  = 12.0  # 年振幅
+    for i, m in enumerate(MONTHS, start=1):
+        tavg = _sin_annual(i, amp, base) + np.random.normal(0, 1.0)
+        tmax = tavg + 6 + np.random.normal(0, 0.8)
+        tmin = tavg - 6 + np.random.normal(0, 0.8)
+        # 降水：给出一个夏季偏多、冬季偏少的分布
+        precip = max(0.0, (8 + 4*np.sin((i-1)/12*2*np.pi)) * (random.uniform(5, 20)))
+        # 日照：夏多冬少
+        sunshine = max(0.0, 150 + 80*np.sin((i-1)/12*2*np.pi) + np.random.normal(0, 10))
+        # 风速：2~6 m/s 小波动
+        wind = _clamp(random.uniform(2.0, 6.0) + np.random.normal(0, 0.5), 0.0, 30.0)
+
+        out[f"tavg_{m}_C"]     = round(float(tavg), 1)
+        out[f"tmax_{m}_C"]     = round(float(tmax), 1)
+        out[f"tmin_{m}_C"]     = round(float(tmin), 1)
+        out[f"precip_{m}_mm"]  = round(float(precip), 1)
+        out[f"sunshine_{m}_h"] = round(float(sunshine), 1)
+        out[f"wind_{m}_ms"]    = round(float(wind), 1)
+    return out
 
 # ---------- predict helpers ----------
-def predict_cluster(row: pd.Series) -> Optional[int]:
+def predict_cluster(row_model_feats: pd.Series) -> Optional[int]:
     if not HAS_CLF: return None
-    r = row.reindex(clf_features)
+    r = row_model_feats.reindex(clf_features)
     num_cols = [c for c in clf_features if c not in clf_cat_features]
     r.loc[num_cols] = pd.to_numeric(r.loc[num_cols], errors="coerce")
     med = r.loc[num_cols].dropna().median()
@@ -227,19 +248,19 @@ def predict_cluster(row: pd.Series) -> Optional[int]:
     pool = Pool(pd.DataFrame([r], columns=clf_features), cat_features=clf_cat_features)
     return int(clf.predict(pool)[0])
 
-def predict_yield(clu: Optional[int], row: pd.Series) -> Tuple[float, List[str], Any]:
+def predict_yield(clu: Optional[int], row_model_feats: pd.Series) -> Tuple[float, List[str], Any]:
     if regressors:
         if clu is None or clu not in regressors:
             raise RuntimeError("No regressor for the detected/selected cluster.")
         feats = regressors[clu]["features"]; model = regressors[clu]["model"]
     else:
         feats = global_regressor["features"]; model = global_regressor["model"]
-    X = row.reindex(feats); X = X.fillna(X.dropna().median())
+    X = row_model_feats.reindex(feats); X = X.fillna(X.dropna().median())
     yhat = float(model.predict(pd.DataFrame([X], columns=feats))[0])
     return yhat, feats, model
 
-def shap_single(row: pd.Series, feats: List[str], model: Any, clu: Optional[int]=None):
-    X = row.reindex(feats).fillna(row.reindex(feats).dropna().median())
+def shap_single(row_model_feats: pd.Series, feats: List[str], model: Any, clu: Optional[int]=None):
+    X = row_model_feats.reindex(feats).fillna(row_model_feats.reindex(feats).dropna().median())
     df1 = pd.DataFrame([X], columns=feats)
     try:
         if isinstance(model, CatBoostRegressor):
@@ -267,25 +288,24 @@ def _mean_of(cols: List[str], row: pd.Series) -> Optional[float]:
     vals = [row.get(c) for c in cols if c in row.index and pd.notna(row.get(c))]
     return float(np.mean(vals)) if vals else None
 
-def climate_fingerprint(row: pd.Series) -> Dict[str, str]:
-    t_cols = [c for c in row.index if "tmean" in c.lower()]
-    p_cols = [c for c in row.index if "precip" in c.lower()]
-    s_cols = [c for c in row.index if ("sun" in c.lower() or "rad" in c.lower())]
-    w_cols = [c for c in row.index if ("wind" in c.lower() or "ws" in c.lower())]
-    d_cols = [c for c in row.index if "dryness" in c.lower()]
+def climate_fingerprint(row_model_feats: pd.Series) -> Dict[str, str]:
+    t_cols = [c for c in row_model_feats.index if "tmean" in c.lower()]
+    p_cols = [c for c in row_model_feats.index if "precip" in c.lower()]
+    s_cols = [c for c in row_model_feats.index if ("sun" in c.lower() or "rad" in c.lower())]
+    w_cols = [c for c in row_model_feats.index if ("wind" in c.lower() or "ws" in c.lower())]
+    d_cols = [c for c in row_model_feats.index if "dryness" in c.lower()]
 
-    t = _mean_of(t_cols, row); p = _mean_of(p_cols, row)
-    s = _mean_of(s_cols, row); w = _mean_of(w_cols, row); d = _mean_of(d_cols, row)
+    t = _mean_of(t_cols, row_model_feats); p = _mean_of(p_cols, row_model_feats)
+    s = _mean_of(s_cols, row_model_feats); w = _mean_of(w_cols, row_model_feats); d = _mean_of(d_cols, row_model_feats)
 
     temp = "hot" if (t is not None and t >= 18) else ("cool" if (t is not None and t <= 8) else "mild")
     moist = "dry" if ((d is not None and d >= 0.9) or (p is not None and p < 60)) else ("wet" if (p is not None and p > 180) else "normal")
     sun   = "sunny" if (s is not None and s >= 220) else ("cloudy" if (s is not None and s <= 120) else "average")
     wind  = "windy" if (w is not None and w >= 6) else ("calm" if (w is not None and w <= 2) else "breezy")
-
     return {"temp": temp, "moist": moist, "sun": sun, "wind": wind}
 
-def insight_text(cluster: Optional[int], row: pd.Series, shap_df: pd.DataFrame) -> str:
-    fp = climate_fingerprint(row)
+def insight_text(cluster: Optional[int], row_model_feats: pd.Series, shap_df: pd.DataFrame) -> str:
+    fp = climate_fingerprint(row_model_feats)
     pos = shap_df.sort_values("shap", ascending=False)
     neg = shap_df.sort_values("shap", ascending=True)
     pos_names = [pos.iloc[i]["feature"] for i in range(min(3, len(pos))) if pos.iloc[i]["shap"] > 0]
@@ -299,7 +319,6 @@ def insight_text(cluster: Optional[int], row: pd.Series, shap_df: pd.DataFrame) 
         parts.append("Positive drivers: " + ", ".join(pos_names) + ".")
     if neg_names:
         parts.append("Limiting factors: " + ", ".join(neg_names) + ".")
-
     tips = []
     if fp["moist"] == "dry":
         tips += ["prioritize irrigation scheduling", "retain soil moisture (mulch)"]
@@ -313,7 +332,6 @@ def insight_text(cluster: Optional[int], row: pd.Series, shap_df: pd.DataFrame) 
         tips += ["use lodging-resistant varieties or windbreaks"]
     if fp["sun"] == "cloudy":
         tips += ["slightly increase seeding density"]
-
     if tips:
         parts.append("Suggested actions: " + "; ".join(tips) + ".")
     return " ".join(parts)
@@ -368,31 +386,43 @@ mode = st.sidebar.radio("Prediction Mode", ["Single prediction", "Batch predicti
 
 if mode == "Batch prediction (CSV)":
     st.subheader("Batch prediction")
+    st.markdown("**CSV 需要包含以下列：**")
+    st.code(", ".join(ALL_INPUT_COLS))
+
     up = st.file_uploader("Upload CSV", type=["csv"])
     if up:
         df_in = pd.read_csv(up)
         out_rows = []
         for i, row in df_in.iterrows():
+            # 1) 月度 -> 模型特征
+            feats_row = monthly_to_features(row)
+
+            # 2) 预测 cluster（若需要）
             clu = None
             if regressors:
                 if "cluster" in df_in.columns and not pd.isna(row.get("cluster", np.nan)):
                     try: clu = int(row["cluster"])
                     except: clu = None
                 if clu is None and HAS_CLF:
-                    clu = predict_cluster(row)
+                    clu = predict_cluster(feats_row)
+
+            # 3) 产量预测
             try:
-                yhat, feats, model = predict_yield(clu, row)
+                yhat, feats, model = predict_yield(clu, feats_row)
                 rec = {"_row": i, "cluster": clu if clu is not None else "global", "predicted_yield": yhat}
-                for extra in ["latitude","longitude","year","sown_area","lat","lon"]:
-                    if extra in df_in.columns: rec[extra] = row[extra]
+                # 附带一些原字段便于回溯
+                for extra in ["latitude","longitude","elevation_m","year","sown_area_hectare"]:
+                    if extra in df_in.columns: rec[extra] = row.get(extra)
                 out_rows.append(rec)
             except Exception as e:
                 out_rows.append({"_row": i, "cluster": clu, "predicted_yield": np.nan, "_error": str(e)})
 
         res = pd.DataFrame(out_rows)
-        st.dataframe(res)
+        st.dataframe(res, use_container_width=True)
         st.download_button("Download results CSV", res.to_csv(index=False).encode("utf-8"),
                            file_name="predictions.csv")
+
+        # 批量PDF（逐行一页）
         try:
             from fpdf import FPDF
             def make_pdf_batch(rows: List[Dict[str, Any]]) -> bytes:
@@ -401,7 +431,7 @@ if mode == "Batch prediction (CSV)":
                     pdf.add_page(); pdf.set_font("Arial", size=14)
                     pdf.cell(0, 10, "Wheat Yield Prediction Report", ln=1)
                     pdf.set_font("Arial", size=11)
-                    for k in ["_row","cluster","predicted_yield","latitude","longitude","sown_area","year"]:
+                    for k in ["_row","cluster","predicted_yield","latitude","longitude","elevation_m","sown_area_hectare","year"]:
                         if k in r and r[k] is not None and not (isinstance(r[k], float) and np.isnan(r[k])):
                             pdf.multi_cell(0, 8, f"{k.replace('_',' ').title()}: {r[k]}")
                     if "_error" in r:
@@ -410,119 +440,119 @@ if mode == "Batch prediction (CSV)":
             pdf_bytes = make_pdf_batch(out_rows)
             st.download_button("Download Reports PDF", data=pdf_bytes,
                                file_name="reports.pdf", mime="application/pdf")
-        except Exception as e:
-            # 静默，不在页面提示
+        except Exception:
             pass
 
 else:
     st.subheader("Single prediction")
 
-    # context fields
+    # ---- 基本信息 ----
     c1, c2 = st.columns(2)
     with c1:
         year = st.number_input("Year", min_value=1900, max_value=2100, value=2018, step=1, key="in_year")
-        sown_area = st.number_input("Sown area (ha)", min_value=0.0, value=1000.0, step=10.0, format="%.2f", key="in_sown_area")
+        sown_area_hectare = st.number_input("sown_area_hectare", min_value=0.0, value=1000.0, step=10.0, format="%.2f", key="in_sown")
     with c2:
-        latitude = st.number_input("Latitude", min_value=-90.0, max_value=90.0, value=34.75, step=0.01, format="%.2f", key="in_latitude")
-        longitude = st.number_input("Longitude", min_value=-180.0, max_value=180.0, value=113.62, step=0.01, format="%.2f", key="in_longitude")
+        latitude = st.number_input("Latitude (°)", min_value=-90.0, max_value=90.0, value=34.75, step=0.01, format="%.2f", key="in_lat")
+        longitude = st.number_input("Longitude (°)", min_value=-180.0, max_value=180.0, value=113.62, step=0.01, format="%.2f", key="in_lon")
+    elevation_m = st.number_input("Elevation (m)", min_value=-500.0, max_value=9000.0, value=50.0, step=1.0, format="%.1f", key="in_elev")
 
-    # randomizers
+    # ---- 自动填充 ----
     st.markdown("**Auto-fill tools**")
-    cc1, cc2, cc3, cc4 = st.columns([1,1,1,2])
-    with cc4:
+    cc1, cc2 = st.columns([1,2])
+    with cc2:
         seed = st.number_input("Random seed (optional)", min_value=0, max_value=10_000_000, value=0, step=1, key="rand_seed")
         seed_val = int(seed) if seed != 0 else None
     with cc1:
-        if st.button("Randomize"):
-            apply_random_to_session(DISPLAY_FEATURES, profile="random", seed=seed_val)
-    with cc2:
-        if st.button("Hot & Dry"):
-            apply_random_to_session(DISPLAY_FEATURES, profile="hot_dry", seed=seed_val)
-    with cc3:
-        if st.button("Cool & Wet"):
-            apply_random_to_session(DISPLAY_FEATURES, profile="cool_wet", seed=seed_val)
+        if st.button("Auto-fill monthly by lat/elev"):
+            auto = autofill_monthly_by_lat_elev(latitude, elevation_m, seed=seed_val)
+            for k, v in auto.items():
+                st.session_state[f"in_{k}"] = v
 
-    # inputs
-    with st.expander("Weather and feature inputs"):
-        groups = group_features(DISPLAY_FEATURES)
-        rendered = set()
-        for gname, cols in groups.items():
-            st.markdown(f"**{gname}**")
-            cols3 = st.columns(3)
-            for i, c in enumerate(cols):
-                if c in rendered: continue
-                rendered.add(c)
-                with cols3[i % 3]:
-                    key = f"in_{c}"; lc = c.lower()
-                    kwargs = {"key": key, "label": label_with_unit(c)}
-                    if "tmean" in lc: kwargs.update(min_value=-30.0, max_value=45.0, step=0.1, format="%.1f")
-                    elif "precip" in lc: kwargs.update(min_value=0.0, max_value=500.0, step=0.1, format="%.1f")
-                    elif ("sun" in lc) or ("rad" in lc): kwargs.update(min_value=0.0, max_value=400.0, step=0.1, format="%.1f")
-                    elif ("wind" in lc) or ("ws" in lc): kwargs.update(min_value=0.0, max_value=30.0, step=0.1, format="%.1f")
-                    elif "dryness" in lc: kwargs.update(min_value=0.0, max_value=2.0, step=0.01, format="%.2f")
-                    st.number_input(**kwargs)
+    # ---- 月度输入网格 ----
+    st.markdown("**Monthly climate inputs**")
+    for row_start in range(0, 12, 3):
+        cols = st.columns(3)
+        for j, m in enumerate(MONTHS[row_start:row_start+3]):
+            with cols[j]:
+                st.markdown(f"**Month {m}**")
+                st.number_input(f"tavg_{m}_C (°C)", key=f"in_tavg_{m}_C", value=float(st.session_state.get(f"in_tavg_{m}_C", 10.0)))
+                st.number_input(f"tmax_{m}_C (°C)", key=f"in_tmax_{m}_C", value=float(st.session_state.get(f"in_tmax_{m}_C", 15.0)))
+                st.number_input(f"tmin_{m}_C (°C)", key=f"in_tmin_{m}_C", value=float(st.session_state.get(f"in_tmin_{m}_C", 5.0)))
+                st.number_input(f"precip_{m}_mm (mm)", key=f"in_precip_{m}_mm", value=float(st.session_state.get(f"in_precip_{m}_mm", 50.0)))
+                st.number_input(f"sunshine_{m}_h (h)", key=f"in_sunshine_{m}_h", value=float(st.session_state.get(f"in_sunshine_{m}_h", 160.0)))
+                st.number_input(f"wind_{m}_ms (m/s)", key=f"in_wind_{m}_ms", value=float(st.session_state.get(f"in_wind_{m}_ms", 3.5)))
 
-    # assemble row
-    row_full = {k.replace("in_",""): v for k,v in st.session_state.items() if k.startswith("in_")}
-    row = pd.Series(row_full, dtype="float64")
+    # ---- 组装一行（月度 -> 模型特征）----
+    raw_monthly = {
+        "latitude": latitude, "longitude": longitude, "elevation_m": elevation_m,
+        "sown_area_hectare": sown_area_hectare, "year": year
+    }
+    for m in MONTHS:
+        for k in ["tavg","tmax","tmin"]:
+            raw_monthly[f"{k}_{m}_C"] = float(st.session_state.get(f"in_{k}_{m}_C", np.nan))
+        raw_monthly[f"precip_{m}_mm"]  = float(st.session_state.get(f"in_precip_{m}_mm", np.nan))
+        raw_monthly[f"sunshine_{m}_h"] = float(st.session_state.get(f"in_sunshine_{m}_h", np.nan))
+        raw_monthly[f"wind_{m}_ms"]    = float(st.session_state.get(f"in_wind_{m}_ms", np.nan))
+    row_monthly = pd.Series(raw_monthly, dtype="float64")
+    row_model_feats = monthly_to_features(row_monthly)
 
+    # ---- 聚类选择/检测 ----
     clu = None
     if regressors:
         if HAS_CLF:
             if st.button("Detect cluster"):
-                det = predict_cluster(row); st.session_state["detected_cluster"] = det
+                det = predict_cluster(row_model_feats); st.session_state["detected_cluster"] = det
                 st.success(f"Detected cluster: {det}")
-            clu = st.session_state.get("detected_cluster", predict_cluster(row))
+            clu = st.session_state.get("detected_cluster", predict_cluster(row_model_feats))
             st.caption(f"Cluster to use: {clu}")
         else:
             clu = st.selectbox("Select cluster", sorted(regressors.keys()))
 
+    # ---- 预测 ----
     if st.button("Predict"):
         try:
-            # predict
-            yhat, feats, model = predict_yield(clu, row)
+            yhat, feats, model = predict_yield(clu, row_model_feats)
             st.markdown(f"### Predicted Yield: **{yhat:.3f} tons/ha**")
 
-            # SHAP & Insight
-            fig, shap_df = shap_single(row, feats, model, clu=clu)
+            fig, shap_df = shap_single(row_model_feats, feats, model, clu=clu)
             st.markdown("**SHAP explanation (Top-10 features):**")
             st.pyplot(fig)
 
-            insight = insight_text(clu, row.reindex(feats), shap_df)
+            insight = insight_text(clu, row_model_feats.reindex(feats), shap_df)
             st.markdown("**Insight**")
             st.info(insight)
 
-            # 单次 PDF 报告
+            # PDF
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cluster_disp = f"Clustered (cluster={clu})" if regressors else "Global model"
             shap_sorted = shap_df.reindex(shap_df["shap"].abs().sort_values(ascending=False).index)
             top_items = list(zip(shap_sorted["feature"].tolist(), shap_sorted["shap"].tolist()))
-            meta = {"year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area}
+            meta = {"year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area_hectare}
             try:
                 pdf_bytes = make_pdf_single(ts, yhat, cluster_disp, meta, top_items, insight)
                 st.download_button("Download PDF report", data=pdf_bytes,
                                    file_name=f"prediction_{ts.replace(':','-').replace(' ','_')}.pdf",
                                    mime="application/pdf")
-            except Exception as e:
-                # 静默，不在页面提示
+            except Exception:
                 pass
 
-            # 历史记录（仅保存与当前模型相关的特征）
+            # 历史记录（保存模型真正使用的特征）
             rec = {
                 "timestamp": ts,
                 "model_type": "clustered" if regressors else "global",
                 "cluster": clu if regressors else None,
                 "predicted_yield": yhat,
-                "year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area
+                "year": year, "latitude": latitude, "longitude": longitude,
+                "elevation_m": elevation_m, "sown_area_hectare": sown_area_hectare
             }
             for f in feats:
-                rec[f] = row_full.get(f, np.nan)
+                rec[f] = row_model_feats.get(f, np.nan)
             st.session_state["history"].append(rec)
 
         except Exception as e:
             st.error(str(e))
 
-    # 历史记录区块
+    # ---- 历史记录 ----
     st.markdown("---")
     st.subheader("Prediction history (this session)")
     if st.session_state["history"]:
