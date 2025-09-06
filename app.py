@@ -1,10 +1,11 @@
 # app.py — Wheat Yield Prediction (cluster-aware with flat-file fallback)
 # 变更：
-#   1) 输入改为：纬度/经度/海拔 + 每月(平均/最高/最低气温、降水、日照、风速) + sown_area_hectare
-#   2) 自动将月度数据聚合为模型所需的季节/农时特征（与你原先的特征名保持一致）
-#   3) 其它功能（聚类检测、PDF、历史记录、Batch）保持不变
-#   4) SHAP 图固定显示绝对值(|value|)；修复小部件默认值冲突
-#   5) Insight：先“天气摘要(只含温度/降水/日照/风)”，后“具体建议”，不展示 cluster 文案
+#   1) 输入：纬度/经度/海拔 + 每月(平均/最高/最低气温、降水、日照、风速) + sown_area_hectare
+#   2) 自动聚合为模型用的季节/农时特征（sowing/overwinter/jointing/heading/filling + dryness + GDD/HDD/CDD）
+#   3) SHAP 图固定显示绝对值(|value|)，不提供开关
+#   4) Insight：英文，一句话“温度/降水/日照/风”摘要 + 可执行建议（阈值触发），不依赖 SHAP
+#   5) 修复：Streamlit 小部件默认值冲突
+#   6) 修复：Insight 使用完整聚合后的行（不再 reindex(feats)），避免信息丢失
 
 import os, io, re, json, joblib, random, datetime
 import streamlit as st
@@ -111,7 +112,7 @@ else:
 if HAS_CLF:
     st.caption("Cluster classifier available: Auto-detect enabled.")
 
-# ========== 新的：月度输入 Schema ==========
+# ========== 月度输入 Schema ==========
 MONTHS = [f"{m:02d}" for m in range(1, 12+1)]
 COLS_MONTHLY = []
 for m in MONTHS:
@@ -275,158 +276,109 @@ def predict_yield(clu: Optional[int], row_model_feats: pd.Series) -> Tuple[float
     yhat = float(model.predict(pd.DataFrame([X], columns=feats))[0])
     return yhat, feats, model
 
-# ---------- insight generation（摘要仅含 温度/降水/日照/风；建议基于阈值） ----------
-def _mean_of(cols: List[str], row: pd.Series) -> Optional[float]:
-    vals = [row.get(c) for c in cols if c in row.index and pd.notna(row.get(c))]
-    return float(np.mean(vals)) if vals else None
-
+# ---------- insight generation（英文摘要+建议） ----------
 def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> str:
     """
     English Insight:
     - One-sentence climate summary using only temperature / precipitation / sunshine / wind.
-    - Followed by actionable, stage-specific farming tips triggered by thresholds.
+    - Then actionable, stage-specific tips triggered by thresholds.
     - No cluster mention, no SHAP dependence.
     """
     def gv(name):
         v = row_model_feats.get(name)
         return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
 
-    # ---- Stage metrics (already aggregated from monthly) ----
+    # Stage metrics
     sow_t   = gv("sowingTmeanAvg");      sow_p   = gv("sowingPrecipSum")
     over_t  = gv("overwinterTmeanAvg");  over_s  = gv("overwinterSunHours")
     joint_t = gv("jointingTmeanAvg");    joint_p = gv("jointingPrecipSum")
     head_t  = gv("headingTmeanAvg");     head_p  = gv("headingPrecipSum");   head_s = gv("headingSunHours"); head_w = gv("headingWindAvg")
     fill_t  = gv("fillingTmeanAvg");     fill_p  = gv("fillingPrecipSum");   fill_s = gv("fillingSunHours"); fill_w = gv("fillingWindAvg")
 
-    # Dryness ratios (precip / (tmean+10)) — used for irrigation triggers
-    d_joint = gv("drynessJointing")
-    d_head  = gv("drynessHeading")
-    d_fill  = gv("drynessFilling")
-
-    # Optional thermal stress indicators (only for tip logic, not in summary)
+    # Dryness & thermal stress (tips only)
+    d_joint = gv("drynessJointing"); d_head = gv("drynessHeading"); d_fill = gv("drynessFilling")
     gdd = gv("gddBase5"); hdd = gv("hddGt30"); cdd = gv("cddLt0")
 
-    # ---- Season rollups for summary (temp/precip/sun/wind only) ----
-    # Temperature: average of available stage means
+    # Season rollups (for summary)
     temp_pool = [x for x in [sow_t, over_t, joint_t, head_t, fill_t] if x is not None]
     season_t = float(np.mean(temp_pool)) if temp_pool else None
-
-    # Precipitation: sum of stages that exist
     precip_pool = [p for p in [sow_p, joint_p, head_p, fill_p] if p is not None]
     season_p = float(np.sum(precip_pool)) if precip_pool else None
-
-    # Sunshine: sum of available key stages
     sun_pool = [s for s in [over_s, head_s, fill_s] if s is not None]
     season_s = float(np.sum(sun_pool)) if sun_pool else None
-
-    # Wind: mean of heading/filling if exist
     wind_pool = [w for w in [head_w, fill_w] if w is not None]
     season_w = float(np.mean(wind_pool)) if wind_pool else None
 
-    # ---- Bucketing to words (summary uses words, not numbers) ----
+    # Bucketing to words
     def bucket_temp(t):
-        if t is None: return None
-        if t < 5:   return "very cool"
-        if t < 10:  return "cool"
-        if t < 18:  return "mild"
-        if t < 24:  return "warm"
-        return "hot"
-
+        if t is None: return "typical temperatures"
+        if t < 5:   return "very cool conditions"
+        if t < 10:  return "cool conditions"
+        if t < 18:  return "mild conditions"
+        if t < 24:  return "warm conditions"
+        return "hot conditions"
     def bucket_rain(p):
-        if p is None: return None
-        if p < 300:  return "dry"
-        if p <= 700: return "moderately wet"
-        return "wet"
-
+        if p is None: return "typical rainfall"
+        if p < 300:  return "dry rainfall"
+        if p <= 700: return "moderate rainfall"
+        return "wet rainfall"
     def bucket_sun(s):
-        if s is None: return None
-        if s < 350:  return "limited"
-        if s <= 650: return "average"
-        return "plentiful"
-
+        if s is None: return "average sunshine"
+        if s < 350:  return "limited sunshine"
+        if s <= 650: return "average sunshine"
+        return "plentiful sunshine"
     def bucket_wind(w):
-        if w is None: return None
-        if w < 2:    return "calm"
-        if w <= 6:   return "breezy"
-        return "windy"
+        if w is None: return "light winds"
+        if w < 2:    return "calm winds"
+        if w <= 6:   return "breezy winds"
+        return "windy conditions"
 
-    temp_desc = bucket_temp(season_t)
-    rain_desc = bucket_rain(season_p)
-    sun_desc  = bucket_sun(season_s)
-    wind_desc = bucket_wind(season_w)
+    summary = (
+        f"Overall, {bucket_temp(season_t)} and {bucket_rain(season_p)}; "
+        f"{bucket_sun(season_s)} with {bucket_wind(season_w)}."
+    )
 
-    # Compose one-sentence summary based on available descriptors
-    parts = []
-    if temp_desc: parts.append(temp_desc)
-    if rain_desc: parts.append(rain_desc)
-    # join climate core with comma
-    core = ", ".join(parts) if parts else "seasonal conditions"
-    # append sun/wind phrases if available
-    tail_bits = []
-    if sun_desc:  tail_bits.append(f"{sun_desc} sunshine")
-    if wind_desc: tail_bits.append(f"{wind_desc} winds")
-    tail = " with " + " and ".join(tail_bits) if tail_bits else ""
-    summary = f"Overall a {core}{tail}."
-
-    # ================== Actionable recommendations ==================
+    # Recommendations
     tips: List[str] = []
-
-    # Moisture management (dryness / low precip near heading/filling)
     if any(d is not None and d >= 0.9 for d in [d_joint, d_head, d_fill]) \
        or (head_p is not None and head_p < 40) or (fill_p is not None and fill_p < 40):
         tips += [
             "During jointing–grain filling, schedule light but frequent irrigations (every 5–7 days).",
-            "Conserve soil moisture with residue mulching or light rolling after sowing."
+            "After sowing, roll lightly or keep residue mulch to conserve moisture."
         ]
-
-    # Excess rain → drainage + disease watch
     if any(p is not None and p > 180 for p in [joint_p, head_p, fill_p]):
         tips += [
-            "Improve drainage promptly after heavy rains; clean furrows in low-lying fields.",
-            "Tight disease scouting around heading (e.g., Fusarium head blight) and treat in time if needed."
+            "After heavy rain, open drainage furrows promptly, especially in low-lying fields.",
+            "Scout closely for diseases around heading (e.g., Fusarium head blight) and treat in time."
         ]
-
-    # Winter cold risk
     if (over_t is not None and over_t < 0) or (cdd is not None and cdd > 150):
         tips += [
-            "Watch cold snaps and apply cold-protection where feasible.",
-            "Split nitrogen applications before winter to avoid lush growth and reduce freeze injury."
+            "Monitor cold snaps; implement cold-protection where feasible.",
+            "Split N before winter to avoid lush growth and reduce freeze injury."
         ]
-
-    # Heat stress around heading/filling
     if (hdd is not None and hdd > 120) or (head_t is not None and head_t > 26) or (fill_t is not None and fill_t > 24):
         tips += [
-            "Ahead of heat waves at heading–filling, irrigate 1–2 days earlier to reduce canopy temperature.",
-            "Prefer heat-tolerant and lodging-resistant varieties; consider mild growth regulators at jointing if canopy is too lush."
+            "Ahead of heat waves at heading–filling, irrigate 1–2 days earlier to lower canopy temperature.",
+            "Prefer heat-tolerant, lodging-resistant cultivars; consider mild growth regulation at jointing if overly lush."
         ]
-
-    # Lodging risk: wind + rain
     if ((head_w is not None and head_w > 6) or (fill_w is not None and fill_w > 6)) \
        and ((head_p is not None and head_p > 120) or (fill_p is not None and fill_p > 120)):
         tips += [
-            "After jointing, cap nitrogen rates and consider growth regulators; set windbreaks or temporary staking where feasible.",
-            "Drain excess water quickly after storms to reduce lodging."
+            "Cap nitrogen after jointing and consider growth regulators; set windbreaks or temporary staking.",
+            "Drain excess water quickly after storms."
         ]
-
-    # Sowing window / stand establishment
     if sow_t is not None and sow_t > 18:
-        tips += ["During sowing under warm conditions, consider slightly earlier sowing or drought-tolerant varieties, and roll after sowing to retain moisture."]
+        tips += ["At sowing under warm conditions, consider slightly earlier sowing or drought-tolerant cultivars; roll after sowing to retain moisture."]
     elif sow_t is not None and sow_t < 5:
-        tips += ["Under cool sowing conditions, delay the sowing window or increase seeding rate by ~10–15% to secure establishment."]
-
-    # Low sunshine
+        tips += ["Under cool sowing conditions, delay sowing or raise seeding rate by ~10–15% to secure establishment."]
     if (over_s is not None and over_s < 100) or (head_s is not None and head_s < 140) or (fill_s is not None and fill_s < 140):
-        tips += ["With limited sunshine, raise seeding density slightly and enhance disease surveillance; avoid excessive nitrogen that promotes lodging."]
-
-    # If none triggered, still provide a general best-practice line
+        tips += ["With limited sunshine, slightly increase plant density and enhance disease surveillance; avoid excessive nitrogen that promotes lodging."]
     if not tips:
         tips = ["Conditions look typical; follow local best practices for cultivar and region."]
 
-    # Compose Markdown
     md = ["**Climate summary**", summary, "", "**Recommendations**"]
-    md += [f"- {t}" for t in list(dict.fromkeys(tips))]  # deduplicate, keep order
+    md += [f"- {t}" for t in list(dict.fromkeys(tips))]
     return "\n".join(md)
-
 
 # ---------- single PDF ----------
 def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
@@ -450,7 +402,7 @@ def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
     pdf.cell(0, 8, "Context:", ln=1)
     pdf.set_font("Arial", "", 11)
     for k in ["year","latitude","longitude","sown_area"]:
-        if k in meta and k is not None:
+        if k in meta and meta[k] is not None:
             pdf.cell(0, 7, f"{k}: {meta[k]}", ln=1)
 
     if top_items:
@@ -622,7 +574,7 @@ else:
             st.markdown("**SHAP explanation (Top-10 features):**")
             st.pyplot(fig)
 
-            # |SHAP| 排序（仅供 PDF top 列表）；Insight 不依赖 SHAP
+            # |SHAP| 排序（PDF 用）；Insight 不依赖 SHAP
             order = np.argsort(np.abs(contrib))[::-1][:min(10, len(contrib))]
             shap_df = pd.DataFrame({
                 "feature": [feat_list[i] for i in order],
@@ -630,9 +582,9 @@ else:
                 "abs_shap": [float(abs(contrib[i])) for i in order]
             })
 
-            # Insight（摘要仅 温度/降水/日照/风）
-            insight = insight_text(clu, row_model_feats.reindex(feats))
-            st.markdown("**Insight**")
+            # ====== 关键修复：Insight 用完整聚合行，不再 reindex(feats) ======
+            insight = insight_text(clu, row_model_feats)
+            st.markdown("**Climate summary & recommendations**")
             st.info(insight)
 
             # PDF
