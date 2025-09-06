@@ -1,7 +1,6 @@
 # app.py — Wheat Yield Prediction (cluster-aware with flat-file fallback)
 
-
-import os, io, re, json, joblib, zipfile, tempfile, random, datetime
+import os, io, re, json, joblib, random, datetime
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -48,8 +47,7 @@ if HAS_CLF:
 # 分簇回归器
 def scan_cluster_regressors() -> Dict[int, Dict[str, Any]]:
     regs: Dict[int, Dict[str, Any]] = {}
-    cand_dirs = [CWD, REG_DIR]
-    for d in cand_dirs:
+    for d in [CWD, REG_DIR]:
         if not os.path.isdir(d): continue
         for fn in os.listdir(d):
             m = re.match(r"cluster_(\d+)\.(pkl|joblib|cbm)$", fn, re.I)
@@ -161,7 +159,7 @@ def monthly_to_features(row: pd.Series) -> pd.Series:
             if (pd.notna(precip_sum) and pd.notna(tavg_mean)) else np.nan
         )
 
-    # 2) GDD/HDD/CDD
+    # 2) GDD/HDD/CDD（简化估算：按月≈30天）
     def _deg_days_pos(x): return max(float(x), 0.0)
     gdd5 = 0.0; hdd30 = 0.0; cdd0 = 0.0
     for m in GROW_MONTHS:
@@ -177,7 +175,7 @@ def monthly_to_features(row: pd.Series) -> pd.Series:
     out["latitude"]      = row.get("latitude")
     out["longitude"]     = row.get("longitude")
     out["elevation_m"]   = row.get("elevation_m")
-    out["sown_area"]     = row.get("sown_area_hectare")
+    out["sown_area"]     = row.get("sown_area_hectare")  # PDF 用
     out["sown_area_hectare"] = row.get("sown_area_hectare")
     out["year"]          = row.get("year")
     return pd.Series(out, dtype="float64")
@@ -212,29 +210,9 @@ def autofill_monthly_by_lat_elev(lat: float, elev: float, seed: Optional[int] = 
         out[f"wind_{m}_ms"]    = round(float(wind), 1)
     return out
 
-# ---------- SHAP helpers ----------
-def _plot_shap_bar(feats: List[str], contrib: np.ndarray, clu: Optional[int], use_abs: bool = False):
-    """返回一个水平条形图：use_abs=True 时按 |SHAP| 绘图"""
-    vals = np.abs(contrib) if use_abs else contrib
-    order = np.argsort(np.abs(contrib))[::-1][:min(10, len(contrib))]
-    names = [feats[i] for i in order][::-1]
-    vplot = [float(vals[i]) for i in order][::-1]
-    fig, ax = plt.subplots(figsize=(7,4))
-    ax.barh(names, vplot)
-    if not use_abs:
-        ax.axvline(0, linestyle="--", linewidth=1)
-    title = f"Cluster {clu} — SHAP top {len(names)}" if clu is not None else f"SHAP top {len(names)}"
-    if use_abs:
-        title += " (|value|)"
-        ax.set_xlabel("Absolute SHAP contribution")
-    else:
-        ax.set_xlabel("SHAP contribution")
-    ax.set_title(title)
-    fig.tight_layout()
-    return fig
-
+# ---------- SHAP ----------
 def shap_single(row_model_feats: pd.Series, feats: List[str], model: Any, clu: Optional[int]=None) -> Tuple[np.ndarray, List[str], float]:
-    """返回 (contrib, feats, base_value)；绘图放到 UI 里按需要画“正常或绝对值”"""
+    """返回 (contrib, feats, base_value)。"""
     X = row_model_feats.reindex(feats).fillna(row_model_feats.reindex(feats).dropna().median())
     df1 = pd.DataFrame([X], columns=feats)
     base_value = 0.0
@@ -251,9 +229,21 @@ def shap_single(row_model_feats: pd.Series, feats: List[str], model: Any, clu: O
         expl = shap.KernelExplainer(f, df1)
         vals = expl.shap_values(df1, nsamples=min(100, 2*len(feats)))
         contrib = np.array(vals)[0]
-        # KernelExplainer 无法直接给 base_value，这里用预测-和近似
         base_value = float(model.predict(df1)[0] - contrib.sum())
     return np.array(contrib, dtype=float), feats, base_value
+
+def _plot_shap_bar_abs(feats: List[str], contrib: np.ndarray, clu: Optional[int]):
+    """水平条形图（固定按 |SHAP| 绘图）。"""
+    order = np.argsort(np.abs(contrib))[::-1][:min(10, len(contrib))]
+    names = [feats[i] for i in order][::-1]
+    vplot = [float(abs(contrib[i])) for i in order][::-1]
+    fig, ax = plt.subplots(figsize=(7,4))
+    ax.barh(names, vplot)
+    title = f"Cluster {clu} — SHAP top {len(names)}" if clu is not None else f"SHAP top {len(names)}"
+    ax.set_title(title)
+    ax.set_xlabel("Absolute SHAP contribution")
+    fig.tight_layout()
+    return fig
 
 # ---------- predict helpers ----------
 def predict_cluster(row_model_feats: pd.Series) -> Optional[int]:
@@ -308,7 +298,7 @@ def insight_text(cluster: Optional[int], row_model_feats: pd.Series, shap_df: pd
     if cluster is not None:
         parts.append(f"Detected climate cluster: {cluster}.")
     parts.append(f"Climate fingerprint: {fp['temp']} & {fp['moist']}, {fp['sun']} radiation, {fp['wind']} winds.")
-    if pos_names: parts.append("Positive drivers: " + ", ".join(pos_names) + ".")
+    if pos_names: parts.append("Positive drivers: " + ", ").join(pos_names)
     if neg_names: parts.append("Limiting factors: " + ", ".join(neg_names) + ".")
     tips = []
     if fp["moist"] == "dry": tips += ["prioritize irrigation scheduling", "retain soil moisture (mulch)"]
@@ -342,7 +332,7 @@ def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
     pdf.cell(0, 8, "Context:", ln=1)
     pdf.set_font("Arial", "", 11)
     for k in ["year","latitude","longitude","sown_area"]:
-        if k in meta and k is not None:
+        if k in meta and meta[k] is not None:
             pdf.cell(0, 7, f"{k}: {meta[k]}", ln=1)
 
     if top_items:
@@ -446,7 +436,7 @@ else:
             for k, v in auto.items():
                 st.session_state[f"in_{k}"] = v
 
-    # ---- 初始化月度默认（修复小部件告警）----
+    # ---- 初始化月度默认（防止小部件告警）----
     def init_monthly_defaults():
         for m in MONTHS:
             st.session_state.setdefault(f"in_tavg_{m}_C", 10.0)
@@ -457,7 +447,7 @@ else:
             st.session_state.setdefault(f"in_wind_{m}_ms", 3.5)
     init_monthly_defaults()
 
-    # ---- 月度输入网格（去掉 value=，只用 key）----
+    # ---- 月度输入网格（只用 key，不传 value）----
     st.markdown("**Monthly climate inputs**")
     for row_start in range(0, 12, 3):
         cols = st.columns(3)
@@ -503,9 +493,6 @@ else:
         else:
             clu = st.selectbox("Select cluster", sorted(regressors.keys()))
 
-    # ---- SHAP 显示选项 ----
-    use_abs = st.checkbox("Plot absolute SHAP (|value|)", value=False, help="勾选后按绝对值绘图，条形全为正，表示影响强度。")
-
     # ---- 预测 ----
     if st.button("Predict"):
         try:
@@ -513,15 +500,12 @@ else:
             st.markdown(f"### Predicted Yield: **{yhat:.3f} tons/ha**")
 
             contrib, feat_list, base_value = shap_single(row_model_feats, feats, model, clu=clu)
-            # 画图（正常 or 绝对值）
-            fig = _plot_shap_bar(feat_list, contrib, clu=clu, use_abs=use_abs)
+            fig = _plot_shap_bar_abs(feat_list, contrib, clu=clu)  # 固定 absolute SHAP
             st.markdown("**SHAP explanation (Top-10 features):**")
             st.pyplot(fig)
-
-            # 展示 Base 校验（可选）
             st.caption(f"Base={base_value:.4f} | Sum(SHAP)={float(np.sum(contrib)):.4f} | Base+Sum≈Pred")
 
-            # 生成 shap_df 供 insight 使用
+            # 生成 shap_df（按 |SHAP| 排序，用于 Insight 与 PDF）
             order = np.argsort(np.abs(contrib))[::-1][:min(10, len(contrib))]
             shap_df = pd.DataFrame({
                 "feature": [feat_list[i] for i in order],
@@ -529,6 +513,7 @@ else:
                 "abs_shap": [float(abs(contrib[i])) for i in order]
             })
 
+            from copy import deepcopy
             insight = insight_text(clu, row_model_feats.reindex(feats), shap_df[["feature","shap"]])
             st.markdown("**Insight**")
             st.info(insight)
