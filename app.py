@@ -336,7 +336,7 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
 
     # actionable tips (threshold triggers)
     tips: List[str] = []
-    # moisture: dryness or low precip near sensitive stages
+    # moisture: low precip near sensitive stages
     dryness_joint = (joint_p is not None and joint_p < 40)
     dryness_head  = (head_p  is not None and head_p  < 40)
     dryness_fill  = (fill_p  is not None and fill_p  < 40)
@@ -407,7 +407,7 @@ def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
     pdf.cell(0, 8, "Context:", ln=1)
     pdf.set_font("Arial", "", 11)
     for k in ["year","latitude","longitude","sown_area"]:
-        if k in meta and meta[k] is not None:
+        if k in meta and k is not None:
             pdf.cell(0, 7, f"{k}: {meta[k]}", ln=1)
 
     if top_items:
@@ -583,7 +583,7 @@ else:
             shap_df = pd.DataFrame({
                 "feature": [feat_list[i] for i in order],
                 "abs_shap": [float(abs(contrib[i])) for i in order],
-                "shap": [float(contrib[i])) for i in order]
+                "shap": [float(contrib[i]) for i in order]
             })
 
             # Insight uses FULL aggregated row (no reindex), so it sees all climate values
@@ -629,8 +629,12 @@ else:
         st.download_button("Download history CSV",
                            hist_df.to_csv(index=False).encode("utf-8"),
                            file_name="prediction_history.csv")
+        if hasattr(st, "experimental_rerun"):  # Streamlit old/new API兼容
+            rerun_fn = st.experimental_rerun
+        else:
+            rerun_fn = st.rerun
         if st.button("Clear history"):
             st.session_state["history"] = []
-            st.experimental_rerun()
+            rerun_fn()
     else:
         st.caption("No predictions yet.")
