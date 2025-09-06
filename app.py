@@ -282,89 +282,151 @@ def _mean_of(cols: List[str], row: pd.Series) -> Optional[float]:
 
 def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> str:
     """
-    输出“天气摘要 + 具体建议”Markdown：
-    - 摘要只包括：温度、降水、日照、风；
-    - 建议依据阈值自动生成（内部可参考 GDD/HDD/CDD，但不在摘要中展示）。
+    English Insight:
+    - One-sentence climate summary using only temperature / precipitation / sunshine / wind.
+    - Followed by actionable, stage-specific farming tips triggered by thresholds.
+    - No cluster mention, no SHAP dependence.
     """
     def gv(name):
         v = row_model_feats.get(name)
         return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
-    def fmt(x, unit="", nd=1, default="-"):
-        return default if x is None else f"{round(float(x), nd)}{unit}"
 
-    # 阶段指标
+    # ---- Stage metrics (already aggregated from monthly) ----
     sow_t   = gv("sowingTmeanAvg");      sow_p   = gv("sowingPrecipSum")
     over_t  = gv("overwinterTmeanAvg");  over_s  = gv("overwinterSunHours")
     joint_t = gv("jointingTmeanAvg");    joint_p = gv("jointingPrecipSum")
     head_t  = gv("headingTmeanAvg");     head_p  = gv("headingPrecipSum");   head_s = gv("headingSunHours"); head_w = gv("headingWindAvg")
     fill_t  = gv("fillingTmeanAvg");     fill_p  = gv("fillingPrecipSum");   fill_s = gv("fillingSunHours"); fill_w = gv("fillingWindAvg")
 
-    d_joint = gv("drynessJointing"); d_head = gv("drynessHeading"); d_fill = gv("drynessFilling")
-    gdd = gv("gddBase5"); hdd = gv("hddGt30"); cdd = gv("cddLt0")  # 仅用于建议逻辑，不在摘要展示
+    # Dryness ratios (precip / (tmean+10)) — used for irrigation triggers
+    d_joint = gv("drynessJointing")
+    d_head  = gv("drynessHeading")
+    d_fill  = gv("drynessFilling")
 
-    # 生长季聚合（温度/降水/日照/风的摘要）
-    season_p = sum([p for p in [sow_p, joint_p, head_p, fill_p] if p is not None]) if any([sow_p, joint_p, head_p, fill_p]) else None
-    season_s = sum([s for s in [over_s, head_s, fill_s] if s is not None]) if any([over_s, head_s, fill_s]) else None
-    season_w = np.nanmean([w for w in [head_w, fill_w] if w is not None]) if any([head_w, fill_w]) else None
-    season_t_key = [x for x in [sow_t, over_t, joint_t, head_t, fill_t] if x is not None]
-    season_t = float(np.nanmean(season_t_key)) if season_t_key else None
+    # Optional thermal stress indicators (only for tip logic, not in summary)
+    gdd = gv("gddBase5"); hdd = gv("hddGt30"); cdd = gv("cddLt0")
 
-    # ========= 天气摘要（只含：温度/降水/日照/风）=========
-    overview_lines = [
-        f"- 温度：播种/越冬/拔节/抽穗/灌浆均温 = {fmt(sow_t,'℃')}/{fmt(over_t,'℃')}/{fmt(joint_t,'℃')}/{fmt(head_t,'℃')}/{fmt(fill_t,'℃')}，季节平均 ≈ {fmt(season_t,'℃')}",
-        f"- 降水：生长季合计 ≈ {fmt(season_p,' mm')}（播种 {fmt(sow_p,' mm')}、拔节 {fmt(joint_p,' mm')}、抽穗 {fmt(head_p,' mm')}、灌浆 {fmt(fill_p,' mm')}）",
-        f"- 日照：越冬/抽穗/灌浆合计 = {fmt(over_s,' h')}/{fmt(head_s,' h')}/{fmt(fill_s,' h')}，季节合计 ≈ {fmt(season_s,' h')}",
-        f"- 风速：抽穗/灌浆平均 = {fmt(head_w,' m/s')}/{fmt(fill_w,' m/s')}，季节平均 ≈ {fmt(season_w,' m/s')}",
-    ]
+    # ---- Season rollups for summary (temp/precip/sun/wind only) ----
+    # Temperature: average of available stage means
+    temp_pool = [x for x in [sow_t, over_t, joint_t, head_t, fill_t] if x is not None]
+    season_t = float(np.mean(temp_pool)) if temp_pool else None
 
-    # ========= 具体建议（阈值触发，去重保序）=========
+    # Precipitation: sum of stages that exist
+    precip_pool = [p for p in [sow_p, joint_p, head_p, fill_p] if p is not None]
+    season_p = float(np.sum(precip_pool)) if precip_pool else None
+
+    # Sunshine: sum of available key stages
+    sun_pool = [s for s in [over_s, head_s, fill_s] if s is not None]
+    season_s = float(np.sum(sun_pool)) if sun_pool else None
+
+    # Wind: mean of heading/filling if exist
+    wind_pool = [w for w in [head_w, fill_w] if w is not None]
+    season_w = float(np.mean(wind_pool)) if wind_pool else None
+
+    # ---- Bucketing to words (summary uses words, not numbers) ----
+    def bucket_temp(t):
+        if t is None: return None
+        if t < 5:   return "very cool"
+        if t < 10:  return "cool"
+        if t < 18:  return "mild"
+        if t < 24:  return "warm"
+        return "hot"
+
+    def bucket_rain(p):
+        if p is None: return None
+        if p < 300:  return "dry"
+        if p <= 700: return "moderately wet"
+        return "wet"
+
+    def bucket_sun(s):
+        if s is None: return None
+        if s < 350:  return "limited"
+        if s <= 650: return "average"
+        return "plentiful"
+
+    def bucket_wind(w):
+        if w is None: return None
+        if w < 2:    return "calm"
+        if w <= 6:   return "breezy"
+        return "windy"
+
+    temp_desc = bucket_temp(season_t)
+    rain_desc = bucket_rain(season_p)
+    sun_desc  = bucket_sun(season_s)
+    wind_desc = bucket_wind(season_w)
+
+    # Compose one-sentence summary based on available descriptors
+    parts = []
+    if temp_desc: parts.append(temp_desc)
+    if rain_desc: parts.append(rain_desc)
+    # join climate core with comma
+    core = ", ".join(parts) if parts else "seasonal conditions"
+    # append sun/wind phrases if available
+    tail_bits = []
+    if sun_desc:  tail_bits.append(f"{sun_desc} sunshine")
+    if wind_desc: tail_bits.append(f"{wind_desc} winds")
+    tail = " with " + " and ".join(tail_bits) if tail_bits else ""
+    summary = f"Overall a {core}{tail}."
+
+    # ================== Actionable recommendations ==================
     tips: List[str] = []
 
-    # 水分：干/涝
-    if any(d is not None and d >= 0.9 for d in [d_joint, d_head, d_fill]) or \
-       (head_p is not None and head_p < 40) or (fill_p is not None and fill_p < 40):
-        tips += ["联合拔节—灌浆期 5–7 天/次小水勤浇，播后镇压或覆盖残茬保墒"]
+    # Moisture management (dryness / low precip near heading/filling)
+    if any(d is not None and d >= 0.9 for d in [d_joint, d_head, d_fill]) \
+       or (head_p is not None and head_p < 40) or (fill_p is not None and fill_p < 40):
+        tips += [
+            "During jointing–grain filling, schedule light but frequent irrigations (every 5–7 days).",
+            "Conserve soil moisture with residue mulching or light rolling after sowing."
+        ]
+
+    # Excess rain → drainage + disease watch
     if any(p is not None and p > 180 for p in [joint_p, head_p, fill_p]):
-        tips += ["连雨及时排水开沟，低洼地先清沟后降渍；抽穗前后加强赤霉病等病害监测并适时用药"]
+        tips += [
+            "Improve drainage promptly after heavy rains; clean furrows in low-lying fields.",
+            "Tight disease scouting around heading (e.g., Fusarium head blight) and treat in time if needed."
+        ]
 
-    # 低温/越冬
+    # Winter cold risk
     if (over_t is not None and over_t < 0) or (cdd is not None and cdd > 150):
-        tips += ["关注寒潮预报并采取防寒；越冬前控旺不过度施氮，氮肥分次施用"]
+        tips += [
+            "Watch cold snaps and apply cold-protection where feasible.",
+            "Split nitrogen applications before winter to avoid lush growth and reduce freeze injury."
+        ]
 
-    # 高温/热害（抽穗/灌浆敏感）
+    # Heat stress around heading/filling
     if (hdd is not None and hdd > 120) or (head_t is not None and head_t > 26) or (fill_t is not None and fill_t > 24):
-        tips += ["抽穗至灌浆遇热浪提前 1–2 天灌溉降温；选耐热抗倒伏品种或在拔节期适度化控"]
+        tips += [
+            "Ahead of heat waves at heading–filling, irrigate 1–2 days earlier to reduce canopy temperature.",
+            "Prefer heat-tolerant and lodging-resistant varieties; consider mild growth regulators at jointing if canopy is too lush."
+        ]
 
-    # 倒伏（风+雨）
-    if ((head_w is not None and head_w > 6) or (fill_w is not None and fill_w > 6)) and \
-       ((head_p is not None and head_p > 120) or (fill_p is not None and fill_p > 120)):
-        tips += ["拔节后控制氮量、适度化控；田边设置防风带/支撑，雨后尽快排水"]
+    # Lodging risk: wind + rain
+    if ((head_w is not None and head_w > 6) or (fill_w is not None and fill_w > 6)) \
+       and ((head_p is not None and head_p > 120) or (fill_p is not None and fill_p > 120)):
+        tips += [
+            "After jointing, cap nitrogen rates and consider growth regulators; set windbreaks or temporary staking where feasible.",
+            "Drain excess water quickly after storms to reduce lodging."
+        ]
 
-    # 播期/密度
+    # Sowing window / stand establishment
     if sow_t is not None and sow_t > 18:
-        tips += ["播种期偏热：适当早播或选耐旱品种，播后镇压并覆盖以保墒"]
+        tips += ["During sowing under warm conditions, consider slightly earlier sowing or drought-tolerant varieties, and roll after sowing to retain moisture."]
     elif sow_t is not None and sow_t < 5:
-        tips += ["播种期偏冷：推迟播期或提高播量 10–15%，确保齐苗壮苗"]
+        tips += ["Under cool sowing conditions, delay the sowing window or increase seeding rate by ~10–15% to secure establishment."]
 
-    # 日照不足
+    # Low sunshine
     if (over_s is not None and over_s < 100) or (head_s is not None and head_s < 140) or (fill_s is not None and fill_s < 140):
-        tips += ["日照偏少：适当提高密度并加强病害预警，合理分配氮肥避免徒长"]
+        tips += ["With limited sunshine, raise seeding density slightly and enhance disease surveillance; avoid excessive nitrogen that promotes lodging."]
 
-    # 积温与品种（内部指标，不在摘要展示）
-    if gdd is not None:
-        if gdd < 350:
-            tips += ["热量资源偏低：优先早熟品种，密植+加强苗期管理以缩短风险暴露期"]
-        elif gdd > 900:
-            tips += ["热量资源充足：可选生育期稍长/高产潜力品种，并匹配分期水肥"]
+    # If none triggered, still provide a general best-practice line
+    if not tips:
+        tips = ["Conditions look typical; follow local best practices for cultivar and region."]
 
-    tips = list(dict.fromkeys(tips))
-
-    md = ["**气候摘要**", *overview_lines, "", "**种植建议**"]
-    if tips:
-        md += [f"- {t}" for t in tips]
-    else:
-        md += ["- 条件总体正常，按当地主推技术路线与品种栽培指南执行即可。"]
+    # Compose Markdown
+    md = ["**Climate summary**", summary, "", "**Recommendations**"]
+    md += [f"- {t}" for t in list(dict.fromkeys(tips))]  # deduplicate, keep order
     return "\n".join(md)
+
 
 # ---------- single PDF ----------
 def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
