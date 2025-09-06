@@ -3,7 +3,7 @@
 # - Monthly inputs -> agronomic features + monthly aliases for model compatibility
 # - Absolute SHAP bar chart (no toggle)
 # - English climate summary + actionable recommendations
-# - Cluster auto-detect (button kept, no text shown)
+# - Cluster detect button (shows result only when clicked)
 # - Single & Batch prediction, PDF report, session history
 
 import os, io, re, json, joblib, random, datetime
@@ -172,24 +172,11 @@ def monthly_to_features(row: pd.Series) -> pd.Series:
     # ---- monthly aliases to match trained feature names ----
     for idx, MM in enumerate(MONTHS, start=1):
         m = str(idx)  # 1..12 without leading zero
-        # temp mean
-        v_t = row.get(f"tavg_{MM}_C")
-        out[f"tmean_{m}"]  = v_t
-        out[f"tmean_{MM}"] = v_t
-        # precip
-        v_p = row.get(f"precip_{MM}_mm")
-        out[f"precip_{m}"]  = v_p
-        out[f"precip_{MM}"] = v_p
-        # sunshine
-        v_s = row.get(f"sunshine_{MM}_h")
-        out[f"sun_{m}"]  = v_s
-        out[f"sun_{MM}"] = v_s
-        # wind
-        v_w = row.get(f"wind_{MM}_ms")
-        out[f"wind_{m}"]  = v_w
-        out[f"wind_{MM}"] = v_w
-        out[f"ws_{m}"]    = v_w
-        out[f"ws_{MM}"]   = v_w
+        v_t = row.get(f"tavg_{MM}_C");         out[f"tmean_{m}"]  = v_t; out[f"tmean_{MM}"] = v_t
+        v_p = row.get(f"precip_{MM}_mm");      out[f"precip_{m}"] = v_p; out[f"precip_{MM}"] = v_p
+        v_s = row.get(f"sunshine_{MM}_h");     out[f"sun_{m}"]    = v_s; out[f"sun_{MM}"]    = v_s
+        v_w = row.get(f"wind_{MM}_ms");        out[f"wind_{m}"]   = v_w; out[f"wind_{MM}"]   = v_w
+        out[f"ws_{m}"] = v_w; out[f"ws_{MM}"] = v_w
 
     # ---- background ----
     out["latitude"]            = row.get("latitude")
@@ -290,14 +277,14 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
         v = row_model_feats.get(name)
         return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
 
-    # Stage metrics (temp/precip/sun/wind only)
+    # Stage metrics
     sow_t   = gv("sowingTmeanAvg");      sow_p   = gv("sowingPrecipSum")
     over_t  = gv("overwinterTmeanAvg");  over_s  = gv("overwinterSunHours")
     joint_t = gv("jointingTmeanAvg");    joint_p = gv("jointingPrecipSum")
     head_t  = gv("headingTmeanAvg");     head_p  = gv("headingPrecipSum");   head_s = gv("headingSunHours"); head_w = gv("headingWindAvg")
     fill_t  = gv("fillingTmeanAvg");     fill_p  = gv("fillingPrecipSum");   fill_s = gv("fillingSunHours"); fill_w = gv("fillingWindAvg")
 
-    # rollups for summary
+    # rollups
     temp_pool = [x for x in [sow_t, over_t, joint_t, head_t, fill_t] if x is not None]
     season_t = float(np.mean(temp_pool)) if temp_pool else None
     precip_pool = [p for p in [sow_p, joint_p, head_p, fill_p] if p is not None]
@@ -335,10 +322,7 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
 
     # actionable tips
     tips: List[str] = []
-    dryness_joint = (joint_p is not None and joint_p < 40)
-    dryness_head  = (head_p  is not None and head_p  < 40)
-    dryness_fill  = (fill_p  is not None and fill_p  < 40)
-    if dryness_joint or dryness_head or dryness_fill:
+    if (joint_p is not None and joint_p < 40) or (head_p is not None and head_p < 40) or (fill_p is not None and fill_p < 40):
         tips += [
             "During jointing–grain filling, schedule light but frequent irrigations (every 5–7 days).",
             "After sowing, roll lightly or keep residue mulch to conserve moisture."
@@ -548,13 +532,15 @@ else:
     row_monthly = pd.Series(raw_monthly, dtype="float64")
     row_model_feats = monthly_to_features(row_monthly)
 
-    # ---- cluster selection/detection (keep button, show no text) ----
+    # ---- cluster selection/detection (show result only when clicked) ----
     clu = None
     if regressors:
         if HAS_CLF:
             if st.button("Detect cluster"):
                 det = predict_cluster(row_model_feats)
-                st.session_state["detected_cluster"] = det   # no UI text
+                st.session_state["detected_cluster"] = det
+                st.success(f"Detected cluster: {det}")  # 显示识别结果
+            # 使用已识别的簇；如未识别则后台预测一个用于回归
             clu = st.session_state.get("detected_cluster", predict_cluster(row_model_feats))
         else:
             clu = st.selectbox("Select cluster", sorted(regressors.keys()))
@@ -577,14 +563,13 @@ else:
                 "shap": [float(contrib[i]) for i in order]
             })
 
-            # Insight (uses full aggregated row)
             insight = insight_text(clu, row_model_feats)
             st.markdown("**Climate summary & recommendations**")
             st.info(insight)
 
             # PDF
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cluster_disp = "Clustered model" if regressors else "Global model"  # no cluster id in PDF
+            cluster_disp = "Clustered model" if regressors else "Global model"  # 不在PDF写簇编号
             top_items = list(zip(shap_df["feature"].tolist(), shap_df["shap"].tolist()))
             meta = {"year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area_hectare}
             try:
@@ -620,7 +605,6 @@ else:
         st.download_button("Download history CSV",
                            hist_df.to_csv(index=False).encode("utf-8"),
                            file_name="prediction_history.csv")
-        # Streamlit rerun compatibility
         rerun_fn = getattr(st, "experimental_rerun", getattr(st, "rerun", None))
         if st.button("Clear history"):
             st.session_state["history"] = []
