@@ -3,7 +3,8 @@
 #   1) 输入改为：纬度/经度/海拔 + 每月(平均/最高/最低气温、降水、日照、风速) + sown_area_hectare
 #   2) 自动将月度数据聚合为模型所需的季节/农时特征（与你原先的特征名保持一致）
 #   3) 其它功能（聚类检测、PDF、历史记录、Batch）保持不变
-#   4) SHAP 图固定显示绝对值(|value|)；修复 Streamlit 小部件默认值冲突和 insight_text 报错
+#   4) SHAP 图固定显示绝对值(|value|)；修复小部件默认值冲突
+#   5) Insight 仅按天气阈值给种植建议（不依赖 SHAP 正负）
 
 import os, io, re, json, joblib, random, datetime
 import streamlit as st
@@ -274,7 +275,7 @@ def predict_yield(clu: Optional[int], row_model_feats: pd.Series) -> Tuple[float
     yhat = float(model.predict(pd.DataFrame([X], columns=feats))[0])
     return yhat, feats, model
 
-# ---------- insight generation ----------
+# ---------- insight generation（基于天气，不依赖 SHAP） ----------
 def _mean_of(cols: List[str], row: pd.Series) -> Optional[float]:
     vals = [row.get(c) for c in cols if c in row.index and pd.notna(row.get(c))]
     return float(np.mean(vals)) if vals else None
@@ -293,39 +294,86 @@ def climate_fingerprint(row_model_feats: pd.Series) -> Dict[str, str]:
     wind  = "windy" if (w is not None and w >= 6) else ("calm" if (w is not None and w <= 2) else "breezy")
     return {"temp": temp, "moist": moist, "sun": sun, "wind": wind}
 
-def insight_text(cluster: Optional[int], row_model_feats: pd.Series, shap_df: pd.DataFrame) -> str:
-    """生成可读的洞察文本；shap_df 需要包含列 ['feature', 'shap']（带符号的 SHAP）。"""
-    fp = climate_fingerprint(row_model_feats)
+def insight_text(cluster: Optional[int], row_model_feats: pd.Series) -> str:
+    """基于聚合后的天气特征给出种植管理建议（不依赖 SHAP 正负）。"""
+    def gv(name):
+        v = row_model_feats.get(name)
+        return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
 
-    # 取前3个正向/负向驱动特征名
-    pos_names = shap_df[shap_df["shap"] > 0].nlargest(3, "shap")["feature"].tolist()
-    neg_names = shap_df[shap_df["shap"] < 0].nsmallest(3, "shap")["feature"].tolist()
+    # 阶段指标
+    sow_t = gv("sowingTmeanAvg")
+    over_t = gv("overwinterTmeanAvg")
+    joint_t = gv("jointingTmeanAvg")
+    head_t = gv("headingTmeanAvg")
+    fill_t = gv("fillingTmeanAvg")
 
+    sow_p = gv("sowingPrecipSum")
+    joint_p = gv("jointingPrecipSum")
+    head_p = gv("headingPrecipSum")
+    fill_p = gv("fillingPrecipSum")
+
+    sun_over = gv("overwinterSunHours")
+    sun_head = gv("headingSunHours")
+    sun_fill = gv("fillingSunHours")
+
+    wind_head = gv("headingWindAvg")
+    wind_fill = gv("fillingWindAvg")
+
+    d_joint = gv("drynessJointing")
+    d_head  = gv("drynessHeading")
+    d_fill  = gv("drynessFilling")
+
+    gdd = gv("gddBase5")
+    hdd = gv("hddGt30")
+    cdd = gv("cddLt0")
+
+    tips: List[str] = []
+
+    # —— 水分管理 —— #
+    if any(d is not None and d >= 0.9 for d in [d_joint, d_head, d_fill]) \
+       or (head_p is not None and head_p < 40) or (fill_p is not None and fill_p < 40):
+        tips += ["联合拔节—灌浆期重点排程灌溉，前置补水降低热干风影响", "覆盖残茬/地膜等以保墒"]
+    if any(p is not None and p > 180 for p in [joint_p, head_p, fill_p]):
+        tips += ["降雨偏多时做好排水，低洼地及时开沟", "加强病害监测（抽穗前后），必要时及时用药"]
+
+    # —— 低温/越冬风险 —— #
+    if (over_t is not None and over_t < 0) or (cdd is not None and cdd > 150):
+        tips += ["关注寒潮预报并采取抗寒措施", "越冬前避免一次性施足氮肥，适当分次"]
+
+    # —— 高温/热害 —— #
+    if (hdd is not None and hdd > 120) or (head_t is not None and head_t > 26) or (fill_t is not None and fill_t > 24):
+        tips += ["抽穗灌浆前适当灌溉降温，缓解热害", "选择耐热、抗倒伏品种；必要时用调节剂抑制过旺"]
+
+    # —— 倒伏风险（风+雨）—— #
+    if ((wind_head is not None and wind_head > 6) or (wind_fill is not None and wind_fill > 6)) \
+       and ((head_p is not None and head_p > 120) or (fill_p is not None and fill_p > 120)):
+        tips += ["分次施氮，拔节后控制氮量；必要时化控/设置防风带"]
+
+    # —— 播期/建株 —— #
+    if sow_t is not None and sow_t > 18:
+        tips += ["适当早播或选耐旱品种，播后镇压保墒"]
+    elif sow_t is not None and sow_t < 5:
+        tips += ["推迟播种或适度提高播量，确保成苗"]
+
+    # —— 辐射不足 —— #
+    if (sun_over is not None and sun_over < 100) or (sun_head is not None and sun_head < 140) or (sun_fill is not None and sun_fill < 140):
+        tips += ["日照偏少，可适当提高播量/密度，并加强病害预警"]
+
+    # —— 积温适配品种 —— #
+    if gdd is not None:
+        if gdd < 350:
+            tips += ["热量资源偏低，优先早熟品种并优化密植"]
+        elif gdd > 900:
+            tips += ["热量资源充足，可选生育期稍长品种并匹配水肥"]
+
+    # 汇总
     parts = []
     if cluster is not None:
         parts.append(f"Detected climate cluster: {cluster}.")
-    parts.append(f"Climate fingerprint: {fp['temp']} & {fp['moist']}, {fp['sun']} radiation, {fp['wind']} winds.")
-    if pos_names:
-        parts.append("Positive drivers: " + ", ".join(pos_names) + ".")
-    if neg_names:
-        parts.append("Limiting factors: " + ", ".join(neg_names) + ".")
-
-    tips = []
-    if fp["moist"] == "dry":
-        tips += ["prioritize irrigation scheduling", "retain soil moisture (mulch)"]
-    elif fp["moist"] == "wet":
-        tips += ["improve drainage after rain", "tight disease scouting", "split nitrogen to avoid lodging"]
-    if fp["temp"] == "hot":
-        tips += ["mitigate heat stress near heading/filling"]
-    elif fp["temp"] == "cool":
-        tips += ["consider earlier-maturing varieties"]
-    if fp["wind"] == "windy":
-        tips += ["use lodging-resistant varieties or windbreaks"]
-    if fp["sun"] == "cloudy":
-        tips += ["slightly increase seeding density"]
-
     if tips:
-        parts.append("Suggested actions: " + "; ".join(tips) + ".")
+        parts.append("Suggested actions: " + "; ".join(dict.fromkeys(tips)) + ".")  # 去重并保持顺序
+    else:
+        parts.append("Conditions look typical; follow standard best practices for the variety and region.")
     return " ".join(parts)
 
 # ---------- single PDF ----------
@@ -522,7 +570,7 @@ else:
             st.markdown("**SHAP explanation (Top-10 features):**")
             st.pyplot(fig)
 
-            # 生成 shap_df（按 |SHAP| 排序，用于 Insight 与 PDF）
+            # 用 |SHAP| 排序（用于 PDF 的 top 列表）；Insight 不依赖 SHAP
             order = np.argsort(np.abs(contrib))[::-1][:min(10, len(contrib))]
             shap_df = pd.DataFrame({
                 "feature": [feat_list[i] for i in order],
@@ -530,7 +578,8 @@ else:
                 "abs_shap": [float(abs(contrib[i])) for i in order]
             })
 
-            insight = insight_text(clu, row_model_feats.reindex(feats), shap_df[["feature","shap"]])
+            # Insight（基于天气阈值）
+            insight = insight_text(clu, row_model_feats.reindex(feats))
             st.markdown("**Insight**")
             st.info(insight)
 
