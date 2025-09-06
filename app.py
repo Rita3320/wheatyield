@@ -3,7 +3,7 @@
 # - Monthly inputs -> agronomic features + monthly aliases for model compatibility
 # - Absolute SHAP bar chart (no toggle)
 # - English climate summary + actionable recommendations
-# - Cluster auto-detect (if classifier present)
+# - Cluster auto-detect (button kept, no text shown)
 # - Single & Batch prediction, PDF report, session history
 
 import os, io, re, json, joblib, random, datetime
@@ -134,7 +134,6 @@ PHASES = {
     "heading":     ["05"],
     "filling":     ["06"],
 }
-GROW_MONTHS = ["10","11","12","01","02","03","04","05","06"]
 
 def _safe_mean(vals):
     vals = [v for v in vals if pd.notna(v)]
@@ -291,7 +290,7 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
         v = row_model_feats.get(name)
         return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
 
-    # Stage metrics
+    # Stage metrics (temp/precip/sun/wind only)
     sow_t   = gv("sowingTmeanAvg");      sow_p   = gv("sowingPrecipSum")
     over_t  = gv("overwinterTmeanAvg");  over_s  = gv("overwinterSunHours")
     joint_t = gv("jointingTmeanAvg");    joint_p = gv("jointingPrecipSum")
@@ -334,9 +333,8 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
 
     summary = f"Overall, {b_temp(season_t)} and {b_rain(season_p)}; {b_sun(season_s)} with {b_wind(season_w)}."
 
-    # actionable tips (threshold triggers)
+    # actionable tips
     tips: List[str] = []
-    # moisture: low precip near sensitive stages
     dryness_joint = (joint_p is not None and joint_p < 40)
     dryness_head  = (head_p  is not None and head_p  < 40)
     dryness_fill  = (fill_p  is not None and fill_p  < 40)
@@ -345,37 +343,31 @@ def insight_text(_cluster_unused: Optional[int], row_model_feats: pd.Series) -> 
             "During jointing–grain filling, schedule light but frequent irrigations (every 5–7 days).",
             "After sowing, roll lightly or keep residue mulch to conserve moisture."
         ]
-    # excess rain
     if any(p is not None and p > 180 for p in [joint_p, head_p, fill_p]):
         tips += [
             "After heavy rain, open drainage furrows promptly, especially in low-lying fields.",
             "Scout closely for diseases around heading (e.g., Fusarium head blight) and treat in time."
         ]
-    # winter cold risk
     if (over_t is not None and over_t < 0):
         tips += [
             "Monitor cold snaps; implement cold-protection where feasible.",
             "Split N before winter to avoid lush growth and reduce freeze injury."
         ]
-    # heat stress
     if (head_t is not None and head_t > 26) or (fill_t is not None and fill_t > 24):
         tips += [
             "Ahead of heat waves at heading–filling, irrigate 1–2 days earlier to lower canopy temperature.",
             "Prefer heat-tolerant, lodging-resistant cultivars; consider mild growth regulation at jointing if overly lush."
         ]
-    # lodging: wind + rain
     if ((head_w is not None and head_w > 6) or (fill_w is not None and fill_w > 6)) and \
        ((head_p is not None and head_p > 120) or (fill_p is not None and fill_p > 120)):
         tips += [
             "Cap nitrogen after jointing and consider growth regulators; set windbreaks or temporary staking.",
             "Drain excess water quickly after storms."
         ]
-    # sowing window / stand
     if sow_t is not None and sow_t > 18:
         tips += ["At sowing under warm conditions, consider slightly earlier sowing or drought-tolerant cultivars; roll after sowing to retain moisture."]
     elif sow_t is not None and sow_t < 5:
         tips += ["Under cool sowing conditions, delay sowing or raise seeding rate by ~10–15% to secure establishment."]
-    # low sunshine
     if (over_s is not None and over_s < 100) or (head_s is not None and head_s < 140) or (fill_s is not None and fill_s < 140):
         tips += ["With limited sunshine, slightly increase plant density and enhance disease surveillance; avoid excessive nitrogen that promotes lodging."]
     if not tips:
@@ -407,7 +399,7 @@ def make_pdf_single(timestamp: str, predicted_yield: float, cluster_disp: str,
     pdf.cell(0, 8, "Context:", ln=1)
     pdf.set_font("Arial", "", 11)
     for k in ["year","latitude","longitude","sown_area"]:
-        if k in meta and k is not None:
+        if k in meta and meta[k] is not None:
             pdf.cell(0, 7, f"{k}: {meta[k]}", ln=1)
 
     if top_items:
@@ -556,15 +548,14 @@ else:
     row_monthly = pd.Series(raw_monthly, dtype="float64")
     row_model_feats = monthly_to_features(row_monthly)
 
-    # ---- cluster selection/detection ----
+    # ---- cluster selection/detection (keep button, show no text) ----
     clu = None
     if regressors:
         if HAS_CLF:
             if st.button("Detect cluster"):
-                det = predict_cluster(row_model_feats); st.session_state["detected_cluster"] = det
-                st.success(f"Detected cluster: {det}")
+                det = predict_cluster(row_model_feats)
+                st.session_state["detected_cluster"] = det   # no UI text
             clu = st.session_state.get("detected_cluster", predict_cluster(row_model_feats))
-            st.caption(f"Cluster to use: {clu}")
         else:
             clu = st.selectbox("Select cluster", sorted(regressors.keys()))
 
@@ -586,14 +577,14 @@ else:
                 "shap": [float(contrib[i]) for i in order]
             })
 
-            # Insight uses FULL aggregated row (no reindex), so it sees all climate values
+            # Insight (uses full aggregated row)
             insight = insight_text(clu, row_model_feats)
             st.markdown("**Climate summary & recommendations**")
             st.info(insight)
 
             # PDF
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cluster_disp = f"Clustered (cluster={clu})" if regressors else "Global model"
+            cluster_disp = "Clustered model" if regressors else "Global model"  # no cluster id in PDF
             top_items = list(zip(shap_df["feature"].tolist(), shap_df["shap"].tolist()))
             meta = {"year": year, "latitude": latitude, "longitude": longitude, "sown_area": sown_area_hectare}
             try:
@@ -629,12 +620,10 @@ else:
         st.download_button("Download history CSV",
                            hist_df.to_csv(index=False).encode("utf-8"),
                            file_name="prediction_history.csv")
-        if hasattr(st, "experimental_rerun"):  # Streamlit old/new API兼容
-            rerun_fn = st.experimental_rerun
-        else:
-            rerun_fn = st.rerun
+        # Streamlit rerun compatibility
+        rerun_fn = getattr(st, "experimental_rerun", getattr(st, "rerun", None))
         if st.button("Clear history"):
             st.session_state["history"] = []
-            rerun_fn()
+            if callable(rerun_fn): rerun_fn()
     else:
         st.caption("No predictions yet.")
